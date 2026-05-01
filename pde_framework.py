@@ -57,6 +57,101 @@ def ensure_expression(value):
     return Constant(float(value))
 
 
+@dataclass(frozen=True)
+class StateFieldSpec:
+    name: str
+    size: int
+    initial: object = 0.0
+    scale: object = 1.0
+
+
+class StateLayout:
+    """
+    Owns the flat state-vector layout so new PDE/state fields only need to be
+    registered once. Slices, initial state, scaling, and derivative packing are
+    then derived from the registry.
+    """
+
+    def __init__(self):
+        self.fields = []
+        self.slices = {}
+        self.total_size = 0
+
+    def register(self, name, size, initial=0.0, scale=1.0):
+        if name in self.slices:
+            raise ValueError(f"State field {name!r} is already registered.")
+        size = int(size)
+        if size <= 0:
+            raise ValueError(f"State field {name!r} must have positive size.")
+        start = self.total_size
+        stop = start + size
+        self.fields.append(StateFieldSpec(name, size, initial, scale))
+        self.slices[name] = slice(start, stop)
+        self.total_size = stop
+        return self.slices[name]
+
+    def __contains__(self, name):
+        return name in self.slices
+
+    def names(self):
+        return [field.name for field in self.fields]
+
+    def slice(self, name):
+        return self.slices[name]
+
+    def get(self, state, name):
+        return state[..., self.slices[name]]
+
+    def pack(self, values, *, device=None, dtype=None):
+        chunks = []
+        for field in self.fields:
+            if field.name in values:
+                value = values[field.name]
+                if not torch.is_tensor(value):
+                    value = torch.as_tensor(value, device=device, dtype=dtype)
+                else:
+                    value = value.to(device=device, dtype=dtype)
+                chunks.append(value.reshape(field.size))
+            else:
+                chunks.append(torch.zeros(field.size, device=device, dtype=dtype))
+        return torch.cat(chunks, dim=0)
+
+    def _resolve_value(self, value, params, device, dtype):
+        if callable(value):
+            value = value(params, device, dtype)
+        elif isinstance(value, str):
+            value = params[value]
+
+        if torch.is_tensor(value):
+            return value.to(device=device, dtype=dtype).reshape(-1)
+        return torch.as_tensor(value, device=device, dtype=dtype).reshape(-1)
+
+    def _expand_field_value(self, field, value):
+        if value.numel() == 1:
+            return value.expand(field.size)
+        if value.numel() != field.size:
+            raise ValueError(
+                f"State field {field.name!r} expected {field.size} values, "
+                f"got {value.numel()}."
+            )
+        return value
+
+    def initial_state(self, params_list, device, dtype):
+        y = torch.zeros((len(params_list), self.total_size), device=device, dtype=dtype)
+        for cell_idx, params in enumerate(params_list):
+            for field in self.fields:
+                value = self._resolve_value(field.initial, params, device, dtype)
+                y[cell_idx, self.slices[field.name]] = self._expand_field_value(field, value)
+        return y
+
+    def scale_vector(self, device, dtype):
+        scale = torch.ones(self.total_size, device=device, dtype=dtype)
+        for field in self.fields:
+            value = self._resolve_value(field.scale, {}, device, dtype)
+            scale[self.slices[field.name]] = self._expand_field_value(field, value)
+        return scale
+
+
 class CompositeMesh:
     """
     Stitched 1D mesh over multiple regions.
