@@ -5,7 +5,7 @@ import time
 import pandas as pd
 from initial_states import get_hardcoded_discharged_state
 from pack_modules import build_balancing_module, build_thermal_module
-from pde_framework import CompositeMesh, ChebyshevRegionOperators, ElectrolytePDEModel, FiniteVolumeOperators
+from pde_framework import CompositeMesh, ChebyshevRegionOperators, ElectrolytePDEModel, FiniteVolumeOperators, StateLayout
 from solver import BasicSolver, AdvancedSolver, ControlledSolver
 
 # Use Double Precision for Battery Physics Stability
@@ -52,6 +52,8 @@ class BatteryPhysics(torch.nn.Module):
         self.electrolyte_mesh = self._build_electrolyte_mesh(p0)
         self.electrolyte_operators = self._build_electrolyte_operators()
         self.electrolyte_model = ElectrolytePDEModel(self.electrolyte_mesh, self.electrolyte_operators)
+        self.state_layout = self._build_state_layout(config)
+        self.state_size = self.state_layout.total_size
         
         # Pack parameters into a dictionary of tensors [N_cells, 1]
         keys = [
@@ -67,6 +69,33 @@ class BatteryPhysics(torch.nn.Module):
         for k in keys:
             vals = [p.get(k, 0.0) for p in params_list]
             self.params[k] = torch.tensor(vals, device=device).reshape(-1, 1)
+
+    def _build_state_layout(self, config):
+        layout = StateLayout()
+        layout.register('cs_n', self.Nr_n, initial=29866.0, scale=30000.0)
+        layout.register('cs_p', self.Nr_p, initial=17038.0, scale=30000.0)
+        layout.register(
+            'electrolyte',
+            self.Nel,
+            initial=lambda p, device, dtype: self.eps_vec.to(device=device, dtype=dtype) * p['ce_0'],
+            scale=1000.0,
+        )
+
+        for field in config.get('extra_state_fields', []):
+            layout.register(
+                field['name'],
+                field['size'],
+                initial=field.get('initial', 0.0),
+                scale=field.get('scale', 1.0),
+            )
+
+        layout.register('sei', self.Nsei, initial=0.0, scale=1.0)
+        layout.register('Lsei', 1, initial='Lsei_0', scale=1e-8)
+        layout.register('temperature', 1, initial='T_amb', scale=300.0)
+        return layout
+
+    def state(self, y, name):
+        return self.state_layout.get(y, name)
 
     def _build_electrolyte_mesh(self, p0):
         region_spec = {
@@ -184,11 +213,11 @@ class BatteryPhysics(torch.nn.Module):
 
     def get_circuit_parameters(self, y_batch):
         p = self.params
-        cs_n = y_batch[:, :self.Nr_n]
-        cs_p = y_batch[:, self.Nr_n:self.Nr_n+self.Nr_p]
-        ce_eps = y_batch[:, self.Nr_n+self.Nr_p : self.Nr_n+self.Nr_p+self.Nel]
-        Lsei = y_batch[:, -2:-1] 
-        T_cell = y_batch[:, -1:] 
+        cs_n = self.state(y_batch, 'cs_n')
+        cs_p = self.state(y_batch, 'cs_p')
+        ce_eps = self.state(y_batch, 'electrolyte')
+        Lsei = self.state(y_batch, 'Lsei')
+        T_cell = self.state(y_batch, 'temperature')
         
         theta_n = cs_n[:, -1:] / p['cs_max_n']
         theta_p = cs_p[:, -1:] / p['cs_max_p']
@@ -232,11 +261,11 @@ class BatteryPhysics(torch.nn.Module):
         return OCV, R_series, I0_n, I0_p, T_cell, V_conc
     
     def compute_derivatives_functional(self, y_flat, I_app, p, y_old=None, dt=None):
-        cs_n = y_flat[:self.Nr_n]
-        cs_p = y_flat[self.Nr_n:self.Nr_n+self.Nr_p]
-        ce_eps = y_flat[self.Nr_n+self.Nr_p : self.Nr_n+self.Nr_p+self.Nel]
-        Lsei = y_flat[-2:-1]
-        T_cell = y_flat[-1:] 
+        cs_n = self.state(y_flat, 'cs_n')
+        cs_p = self.state(y_flat, 'cs_p')
+        ce_eps = self.state(y_flat, 'electrolyte')
+        Lsei = self.state(y_flat, 'Lsei')
+        T_cell = self.state(y_flat, 'temperature')
         
         inv_T = 1.0 / T_cell
         inv_T_ref = 1.0 / 298.15
@@ -365,9 +394,9 @@ class BatteryPhysics(torch.nn.Module):
             # Overwrite Boundary Time Derivatives with Algebraic Constraints
             # Mathematically: R = y - y_o - dt * dy
             # If dy = (y - y_o)/dt - BC/dt --> R = BC
-            y_o_cs_n = y_old[:self.Nr_n]
-            y_o_cs_p = y_old[self.Nr_n:self.Nr_n+self.Nr_p]
-            ce_o = y_old[self.Nr_n+self.Nr_p : self.Nr_n+self.Nr_p+self.Nel]
+            y_o_cs_n = self.state(y_old, 'cs_n')
+            y_o_cs_p = self.state(y_old, 'cs_p')
+            ce_o = self.state(y_old, 'electrolyte')
             
             dcs_n_out[0]  = (cs_n[0] - y_o_cs_n[0])/dt - BC_rn_cent/dt
             dcs_n_out[-1] = (cs_n[-1] - y_o_cs_n[-1])/dt - BC_rn_surf/dt
@@ -387,7 +416,15 @@ class BatteryPhysics(torch.nn.Module):
                 },
             )
 
-        return torch.cat([dcs_n_out, dcs_p_out, dce_out, torch.zeros(self.Nsei, device=self.device), dLsei_dt, dT_dt])
+        derivatives = {
+            'cs_n': dcs_n_out,
+            'cs_p': dcs_p_out,
+            'electrolyte': dce_out,
+            'sei': torch.zeros(self.Nsei, device=self.device, dtype=y_flat.dtype),
+            'Lsei': dLsei_dt,
+            'temperature': dT_dt,
+        }
+        return self.state_layout.pack(derivatives, device=self.device, dtype=y_flat.dtype)
 
     def batched_derivatives(self, y_batch, I_batch, y_old_batch=None, dt=None):
         if y_old_batch is not None:
@@ -432,14 +469,7 @@ class ImplicitBatterySolver:
         self.balancing_module = build_balancing_module(**self.balancing_options)
         self.thermal_module = build_thermal_module(**self.thermal_options)
 
-        # Jacobian Scaling Factors
-        state_dim = self.physics.Nr_n + self.physics.Nr_p + self.physics.Nel + self.physics.Nsei + 2
-        self.scale = torch.ones(state_dim, device=self.device)
-        self.scale[:self.physics.Nr_n] = 30000.0  
-        self.scale[self.physics.Nr_n : self.physics.Nr_n+self.physics.Nr_p] = 30000.0 
-        self.scale[self.physics.Nr_n+self.physics.Nr_p : self.physics.Nr_n+self.physics.Nr_p+self.physics.Nel] = 1000.0 
-        self.scale[-2] = 1e-8 
-        self.scale[-1] = 300.0 
+        self.scale = self.physics.state_layout.scale_vector(self.device, torch.float64)
 
         self.basic_solver = BasicSolver(self)
         self.advanced_solver = AdvancedSolver(self)
@@ -447,13 +477,7 @@ class ImplicitBatterySolver:
         self.y = self._build_initial_state(discretization, self.raw_params).to(self.device)
 
     def _create_fully_charged_state(self, disc, params):
-        y = torch.zeros(self.n_cells, self.physics.Nr_n + self.physics.Nr_p + self.physics.Nel + self.physics.Nsei + 2)
-        for i, p in enumerate(params):
-            y[i, :disc['Nr_n']] = 29866.0
-            y[i, disc['Nr_n']:disc['Nr_n']+disc['Nr_p']] = 17038.0
-            y[i, disc['Nr_n']+disc['Nr_p'] : disc['Nr_n']+disc['Nr_p']+self.physics.Nel] = self.physics.eps_vec * p['ce_0']
-            y[i, -2], y[i, -1] = p['Lsei_0'], p['T_amb']
-        return y
+        return self.physics.state_layout.initial_state(params, self.device, torch.float64)
 
     def _build_initial_state(self, disc, params):
         mode = self.initial_state_mode.lower()
@@ -467,7 +491,10 @@ class ImplicitBatterySolver:
         hardcoded_state = get_hardcoded_discharged_state(disc)
         if hardcoded_state is not None:
             print("Using saved fully discharged initial state preset.")
-            return hardcoded_state.unsqueeze(0).repeat(self.n_cells, 1)
+            if hardcoded_state.numel() == self.physics.state_size:
+                return hardcoded_state.unsqueeze(0).repeat(self.n_cells, 1)
+
+            return self._merge_base_state_with_current_layout(hardcoded_state, disc, params)
 
         reference_state = self._get_discharged_reference_state(
             disc,
@@ -478,7 +505,29 @@ class ImplicitBatterySolver:
             coarse_dt=self.initial_state_options.get('coarse_dt', 10.0),
             refine_margin=self.initial_state_options.get('refine_margin', 0.08)
         )
-        return reference_state.unsqueeze(0).repeat(self.n_cells, 1)
+        if reference_state.numel() == self.physics.state_size:
+            return reference_state.unsqueeze(0).repeat(self.n_cells, 1)
+        return self._merge_base_state_with_current_layout(reference_state, disc, params)
+
+    def _merge_base_state_with_current_layout(self, base_state, disc, params):
+        y = self._create_fully_charged_state(disc, params)
+        old_slices = {}
+        cursor = 0
+        for name, size in [
+            ('cs_n', disc['Nr_n']),
+            ('cs_p', disc['Nr_p']),
+            ('electrolyte', self.physics.Nel),
+            ('sei', disc['Nsei']),
+            ('Lsei', 1),
+            ('temperature', 1),
+        ]:
+            old_slices[name] = slice(cursor, cursor + size)
+            cursor += size
+
+        for name, old_slice in old_slices.items():
+            if name in self.physics.state_layout:
+                y[:, self.physics.state_layout.slice(name)] = base_state[old_slice].unsqueeze(0)
+        return y
 
     @classmethod
     def _get_discharged_reference_state(

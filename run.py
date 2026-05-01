@@ -4,7 +4,7 @@ from controllers import build_controller
 # Configuration for the battery pack
 config = {
     'n_series': 4,      # Number of cells in series
-    'n_parallel': 15   # Number of cells in parallel
+    'n_parallel': 4   # Number of cells in parallel
 }
 
 # Discretization parameters
@@ -67,11 +67,11 @@ battery_solver = ImplicitBatterySolver(
 )
 
 # Simulation mode selection
-use_controller = True
+use_controller = False
 
 # Non-controller settings
 solver_method = 'basic'   # 'basic' or 'advanced'
-pack_current = 15.0
+pack_current = 20.0
 
 # Controller settings
 controller_strategy = 'current_profile'   # 'constant_current', 'current_profile', 'cc_cv', 'mpc'
