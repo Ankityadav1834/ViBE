@@ -1,0 +1,577 @@
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import time
+import pandas as pd
+import os
+from scipy.interpolate import interp1d
+
+# Use Double Precision for Battery Physics Stability
+torch.set_default_dtype(torch.float64)
+
+# ==========================================
+# 1. DATA UTILITIES (Interpolation)
+# ==========================================
+
+class TorchInterpolant:
+    """A 1D linear interpolator for PyTorch tensors."""
+    def __init__(self, x, y):
+        x = np.array(x, dtype=np.float64)
+        y = np.array(y, dtype=np.float64)
+        sort_idx = np.argsort(x)
+        self.x = torch.as_tensor(x[sort_idx])
+        self.y = torch.as_tensor(y[sort_idx])
+    
+    def __call__(self, x_new):
+        input_is_tensor = torch.is_tensor(x_new)
+        if not input_is_tensor:
+            x_new = torch.as_tensor(x_new, device=self.x.device, dtype=self.x.dtype)
+        if self.x.device != x_new.device:
+            self.x = self.x.to(x_new.device)
+            self.y = self.y.to(x_new.device)
+            
+        val = torch.clamp(x_new, self.x.min(), self.x.max())
+        idx = torch.searchsorted(self.x, val) - 1
+        idx = torch.clamp(idx, 0, len(self.x) - 2)
+        
+        x0, x1 = self.x[idx], self.x[idx+1]
+        y0, y1 = self.y[idx], self.y[idx+1]
+        
+        t = (val - x0) / (x1 - x0 + 1e-20)
+        out = y0 + t * (y1 - y0)
+        
+        if input_is_tensor: return out
+        res = out.detach().cpu().numpy()
+        return float(res) if res.ndim == 0 else res
+
+def load_csv_data(filename):
+    """Utility to load 2-column CSV data. Returns zeros if file not found."""
+    if not os.path.exists(filename):
+        return np.linspace(0, 1, 10, dtype=np.float64), np.zeros(10, dtype=np.float64)
+    df = pd.read_csv(filename, header=None).apply(pd.to_numeric, errors='coerce').dropna()
+    data = df.values.astype(np.float64)
+    return data[:, 0], data[:, 1]
+
+# ==========================================
+# 2. CHEMISTRY PARAMETER DEFINITIONS
+# ==========================================
+
+def get_lithium_ion_chen2020():
+    def ocp_n(sto):
+        return (1.9793 * torch.exp(-39.3631 * sto) + 0.2482 
+                - 0.0909 * torch.tanh(29.8538 * (sto - 0.1234)) 
+                - 0.04478 * torch.tanh(14.9159 * (sto - 0.2769)) 
+                - 0.0205 * torch.tanh(30.4444 * (sto - 0.6103)))
+    def ocp_p(sto):
+        return (-0.8090 * sto + 4.4875 
+                - 0.0428 * torch.tanh(18.5138 * (sto - 0.5542)) 
+                - 17.7326 * torch.tanh(15.7890 * (sto - 0.3117)) 
+                + 17.5842 * torch.tanh(15.9308 * (sto - 0.3120)))
+    return {
+        "name": "Li-ion_Chen2020",
+        "ocp_n": ocp_n, "ocp_p": ocp_p,
+        "cond_e": lambda ce, T: (0.1297 * (ce/1000)**3 - 2.51 * (ce/1000)**1.5 + 3.329 * (ce/1000)),
+        "diff_e": lambda ce, T: (8.794e-11 * (ce/1000)**2 - 3.972e-10 * (ce/1000) + 4.862e-10),
+        "params": {
+            'Ln': 8.52e-05, 'Ls': 1.20e-05, 'Lp': 7.56e-05, 'A': 0.1027, 'Rs_n': 5.86e-06, 'Rs_p': 5.22e-06,
+            'F': 96485.33, 'R_g': 8.314, 'Ds_n': 3.3e-14, 'Ds_p': 4e-15, 'cs_max_n': 33133.0, 'cs_max_p': 63104.0,
+            'as_n': 3.83e5, 'as_p': 3.82e5, 'sigma_n': 215.0, 'sigma_p': 0.18, 'eps_e_n': 0.25, 'eps_e_s': 0.47, 'eps_e_p': 0.335,
+            't_plus': 0.2594, 'ce_0': 1000.0, 'b': 1.5, 'm_ref_n': 6.48e-7, 'E_r_n': 35000, 'm_ref_p': 3.42e-6, 'E_r_p': 17800,
+            'kappa_sei': 1/200000.0, 'Msei': 0.162, 'rho_sei': 1690.0, 'Us': 0.4, 'Lsei_0': 5e-9,
+            'Vol_cell': 2.42e-5, 'rho_Cp': 1.7676e6, 'hA': 0.0531, 'T_amb': 298.15,
+            'nominal_cap': 5.0, 'v_min': 2.5, 'v_max': 4.2, 'cs_n_init': 29866.0, 'cs_p_init': 17038.0,
+            'sei_enabled': 1.0 
+        }
+    }
+
+# ==========================================
+# 3. BMS & BALANCING STRATEGIES
+# ==========================================
+
+class BMSStrategy(torch.nn.Module):
+    def compute_balancing_currents(self, V_cells, I_string):
+        """Returns the balancing current added to each cell. Positive = internal cell charging."""
+        return torch.zeros_like(V_cells)
+
+class PassiveBalancing(BMSStrategy):
+    """Bleeds energy through a resistor when cell voltage exceeds threshold during charge."""
+    def __init__(self, R_bleed=10.0, V_thresh=4.0):
+        super().__init__()
+        self.R_bleed = R_bleed
+        self.V_thresh = V_thresh
+
+    def compute_balancing_currents(self, V_cells, I_string):
+        # Softplus ensures differentiability and no sudden jumps
+        v_excess = torch.nn.functional.softplus((V_cells - self.V_thresh) * 50.0) / 50.0
+        # Convert I_string to a tensor for use with torch.sigmoid
+        I_tensor = torch.as_tensor(I_string, device=V_cells.device, dtype=V_cells.dtype)
+        # Only activate during charge (I_string < 0)
+        is_charging = torch.sigmoid(-I_tensor * 1000.0)
+        # Bleed current is subtracted from the charging current (which is negative)
+        # To reduce charge current magnitude, we ADD positive current to the cell's net flow
+        I_bleed = (v_excess / self.R_bleed) * is_charging
+        return I_bleed
+
+class ActiveCapacitorBalancing(BMSStrategy):
+    """Shuttles energy between adjacent cells using switched capacitors."""
+    def __init__(self, R_eq=0.5):
+        super().__init__()
+        self.R_eq = R_eq # Equivalent transfer resistance
+
+    def compute_balancing_currents(self, V_cells, I_string):
+        I_bal = torch.zeros_like(V_cells)
+        # Transfer from i to i+1
+        for i in range(V_cells.shape[0] - 1):
+            i_transfer = (V_cells[i] - V_cells[i+1]) / self.R_eq
+            I_bal[i] -= i_transfer   # Loss from i
+            I_bal[i+1] += i_transfer # Gain to i+1
+        return I_bal
+
+class ActiveInductorBalancing(BMSStrategy):
+    """DC-DC converter equalizing cells towards the pack average voltage."""
+    def __init__(self, transfer_gain=2.0):
+        super().__init__()
+        self.K = transfer_gain 
+
+    def compute_balancing_currents(self, V_cells, I_string):
+        V_avg = torch.mean(V_cells)
+        # If V_cell < V_avg, it receives positive current (reduces discharge or increases charge)
+        return self.K * (V_avg - V_cells)
+
+# ==========================================
+# 4. THERMAL MANAGEMENT STRATEGIES
+# ==========================================
+
+class ThermalStrategy(torch.nn.Module):
+    def compute_temperatures(self, T_cells, Q_gen, Cth, Gth, dt):
+        """Returns dT/dt for the core physics step."""
+        pass
+
+class AmbientConvection(ThermalStrategy):
+    def __init__(self, hA=0.05, T_amb=298.15):
+        super().__init__()
+        self.hA = hA
+        self.T_amb = T_amb
+        
+    def compute_temperatures(self, T_cells, Q_gen, Cth, Gth, dt):
+        Q_out = self.hA * (T_cells - self.T_amb)
+        Q_cond = Gth @ T_cells - torch.sum(Gth, 1, True) * T_cells
+        return (Q_gen - Q_out + Q_cond) / (Cth + 1e-20)
+
+class ActiveLiquidCooling(ThermalStrategy):
+    """Cold plate liquid cooling with longitudinal temperature gradients."""
+    def __init__(self, hA_contact=2.5, m_dot_Cp=5.0, T_inlet=298.15):
+        super().__init__()
+        self.hA = hA_contact
+        self.m_dot_Cp = m_dot_Cp
+        self.T_inlet = T_inlet
+        
+    def compute_temperatures(self, T_cells, Q_gen, Cth, Gth, dt):
+        # Calculate fluid temperature distribution along the string (Steady-state approx)
+        effectiveness = 1.0 - np.exp(-self.hA / self.m_dot_Cp)
+        T_fluid = [torch.tensor(self.T_inlet, device=T_cells.device, dtype=torch.float64)]
+        
+        for i in range(T_cells.shape[0] - 1):
+            T_f_out = T_fluid[i] + (T_cells[i, 0] - T_fluid[i]) * effectiveness
+            T_fluid.append(T_f_out)
+            
+        T_fluid_tensor = torch.stack(T_fluid).unsqueeze(1)
+        
+        Q_out = self.hA * (T_cells - T_fluid_tensor)
+        Q_cond = Gth @ T_cells - torch.sum(Gth, 1, True) * T_cells
+        return (Q_gen - Q_out + Q_cond) / (Cth + 1e-20)
+
+class PCMCooling(ThermalStrategy):
+    """Phase Change Material wrapping around cells. Absorbs latent heat isotropically."""
+    def __init__(self, hA_amb=0.05, T_amb=298.15, T_melt=308.15, L_fusion=50000.0, smoothing_width=1.5):
+        super().__init__()
+        self.hA = hA_amb
+        self.T_amb = T_amb
+        self.T_melt = T_melt
+        self.L_fusion = L_fusion
+        self.width = smoothing_width
+        
+    def compute_temperatures(self, T_cells, Q_gen, Cth, Gth, dt):
+        # Apparent Heat Capacity Method (Continuous to maintain stable Jacobian)
+        delta_smooth = torch.exp(-((T_cells - self.T_melt) / self.width)**2) / (self.width * np.sqrt(np.pi))
+        C_eff = Cth + self.L_fusion * delta_smooth
+        
+        Q_out = self.hA * (T_cells - self.T_amb)
+        Q_cond = Gth @ T_cells - torch.sum(Gth, 1, True) * T_cells
+        return (Q_gen - Q_out + Q_cond) / (C_eff + 1e-20)
+
+# ==========================================
+# 5. BATTERY CORE PHYSICS
+# ==========================================
+
+class BatteryPhysics(torch.nn.Module):
+    def __init__(self, disc, chemistry_data, params_list, device):
+        super().__init__()
+        self.device = device; self.chem = chemistry_data; self.n_cells = len(params_list)
+        self.Nr_n, self.Nr_p = disc['Nr_n'], disc['Nr_p']
+        self.Nx_n, self.Nx_s, self.Nx_p = disc['Nx_n'], disc['Nx_s'], disc['Nx_p']
+        self.Nel, self.Nsei = self.Nx_n + self.Nx_s + self.Nx_p, disc['Nsei']
+        
+        p0 = params_list[0]
+        self.dx_vec = torch.cat([torch.full((self.Nx_n,), p0['Ln']/self.Nx_n), torch.full((self.Nx_s,), p0['Ls']/self.Nx_s), torch.full((self.Nx_p,), p0['Lp']/self.Nx_p)]).to(device)
+        self.eps_vec = torch.cat([torch.full((self.Nx_n,), p0['eps_e_n']), torch.full((self.Nx_s,), p0['eps_e_s']), torch.full((self.Nx_p,), p0['eps_e_p'])]).to(device)
+        self.A_n, self.B_n = self._build_solid_matrices(self.Nr_n); self.A_p, self.B_p = self._build_solid_matrices(self.Nr_p)
+        self.params = {k: ([p.get(k, 0.0) for p in params_list] if any(callable(p.get(k, 0.0)) for p in params_list) else torch.tensor([p.get(k, 0.0) for p in params_list], device=device).reshape(-1, 1)) for k in p0.keys()}
+
+    def _build_solid_matrices(self, N):
+        A, B = torch.zeros(N, N, device=self.device), torch.zeros(N, device=self.device)
+        idx = torch.arange(1, N-1, device=self.device)
+        A[idx, idx] = -2.0; A[idx, idx-1] = 1.0 - 1.0/(idx.double()+1); A[idx, idx+1] = 1.0 + 1.0/(idx.double()+1)
+        A[0,0] = -2.0; A[0,1] = 2.0; A[-1,-1] = -2.0; A[-1,-2] = 2.0; B[-1] = 2.0 + 2.0/(N-1)
+        return A, B
+
+    def calculate_ocp(self, stoich, electrode):
+        s = torch.clamp(stoich, 0.0001, 0.9999)
+        return self.chem['ocp_n'](s) if electrode == 'anode' else self.chem['ocp_p'](s)
+
+    def get_circuit_parameters(self, y_batch):
+        p = self.params
+        def get_p(key, idx=None, *args):
+            v = p[key]
+            if isinstance(v, list): return v[idx](*args) if idx is not None else torch.stack([v[i](*args) for i in range(len(v))])
+            return v
+            
+        cs_n, cs_p = y_batch[:, :self.Nr_n], y_batch[:, self.Nr_n:self.Nr_n+self.Nr_p]
+        ce_eps = y_batch[:, self.Nr_n+self.Nr_p : self.Nr_n+self.Nr_p+self.Nel]
+        Lsei, T_cell = y_batch[:, -2:-1], y_batch[:, -1:] 
+        
+        theta_n, theta_p = cs_n[:, -1:] / get_p('cs_max_n'), cs_p[:, -1:] / get_p('cs_max_p')
+        Un, Up = self.calculate_ocp(theta_n, 'anode'), self.calculate_ocp(theta_p, 'cathode')
+        ce_real = ce_eps / (self.eps_vec.unsqueeze(0) + 1e-12)
+        kappa = self.chem['cond_e'](ce_real, T_cell)
+        eff_k = torch.sum(self.dx_vec) / torch.sum(self.dx_vec / (kappa + 1e-12), dim=1, keepdim=True)
+        R_eff_term = (get_p('Ln')/(3*get_p('eps_e_n')**get_p('b')) + get_p('Ls')/(get_p('eps_e_s')**get_p('b')) + get_p('Lp')/(3*get_p('eps_e_p')**get_p('b')))
+        R_electrolyte = (1.0 / (get_p('A') * (eff_k + 1e-9))) * R_eff_term
+
+        avg_ln_n = torch.sum(torch.log(torch.clamp(ce_real[:, :self.Nx_n], 1e-6)) * self.dx_vec[:self.Nx_n], 1, True) / get_p('Ln')
+        avg_ln_p = torch.sum(torch.log(torch.clamp(ce_real[:, -self.Nx_p:], 1e-6)) * self.dx_vec[-self.Nx_p:], 1, True) / get_p('Lp')
+        V_conc = (2 * get_p('R_g') * T_cell / get_p('F')) * (1.0 - get_p('t_plus')) * (avg_ln_n - avg_ln_p)
+
+        arr = torch.exp(get_p('E_r_n') / get_p('R_g') * (1/298.15 - 1/T_cell))
+        j0_n = get_p('m_ref_n', None, cs_n[:, -1:]) * arr * torch.sqrt(torch.mean(ce_real[:, :self.Nx_n], 1, True)) * torch.sqrt(torch.clamp(cs_n[:, -1:]*(get_p('cs_max_n')-cs_n[:, -1:]), 1e-12))
+        
+        # FIXED: Changed cs_p[-1:] to cs_p[:, -1:] below to avoid broadcasting [1, 50] against [3, 1] which produced [3, 50] outputs.
+        j0_p = get_p('m_ref_p', None, cs_p[:, -1:]) * arr * torch.sqrt(torch.mean(ce_real[:, -self.Nx_p:], 1, True)) * torch.sqrt(torch.clamp(cs_p[:, -1:]*(get_p('cs_max_p')-cs_p[:, -1:]), 1e-12))
+        I0_n, I0_p = j0_n * get_p('A') * get_p('Ln') * get_p('as_n'), j0_p * get_p('A') * get_p('Lp') * get_p('as_p')
+        R_sei = (Lsei / (get_p('as_n') * get_p('A') * get_p('Ln') * get_p('kappa_sei'))) * get_p('sei_enabled')
+        
+        return Up - Un, (get_p('Ln')/get_p('sigma_n') + get_p('Lp')/get_p('sigma_p'))/(3*get_p('A')) + R_electrolyte + R_sei, I0_n, I0_p, T_cell, V_conc
+
+    def compute_cell_derivatives(self, y_f, I_app, p):
+        def lp(k, *a): return p[k](*a) if callable(p[k]) else p[k]
+        idx_ce_start = self.Nr_n + self.Nr_p
+        idx_ce_end = idx_ce_start + self.Nel
+        
+        cs_n, cs_p = y_f[:self.Nr_n], y_f[self.Nr_n : idx_ce_start]
+        ce_eps = y_f[idx_ce_start : idx_ce_end]
+        Lsei, T_cell = y_f[-2], y_f[-1]
+        
+        theta_n, theta_p = cs_n[-1] / lp('cs_max_n'), cs_p[-1] / lp('cs_max_p')
+        ce_real = ce_eps / (self.eps_vec + 1e-12)
+        
+        i_side = (165.96e-6 * torch.exp(-6.3e9 * Lsei) * torch.exp(-0.55 * lp('F') * (self.calculate_ocp(theta_n, 'anode') - I_app*(Lsei/(lp('as_n')*lp('A')*lp('Ln')*lp('kappa_sei'))) - lp('Us')) / (lp('R_g') * T_cell))) * lp('sei_enabled')
+        dLsei_dt = i_side * lp('Msei') / (2 * lp('F') * lp('rho_sei') + 1e-20)
+        
+        dcs_n = (lp('Ds_n', theta_n, T_cell)/(lp('Rs_n')/(self.Nr_n-1))**2) * torch.mv(self.A_n, cs_n) + (-1.0/(lp('A')*lp('Ln')*lp('F')*lp('as_n')*(lp('Rs_n')/(self.Nr_n-1)))) * self.B_n * (I_app - lp('as_n')*lp('Ln')*lp('A')*i_side)
+        dcs_p = (lp('Ds_p', theta_p, T_cell)/(lp('Rs_p')/(self.Nr_p-1))**2) * torch.mv(self.A_p, cs_p) + (1.0/(lp('A')*lp('Lp')*lp('F')*lp('as_p')*(lp('Rs_p')/(self.Nr_p-1)))) * self.B_p * I_app
+        
+        Deff = self.chem['diff_e'](ce_real, T_cell) * (self.eps_vec**lp('b'))
+        flux = - (2*Deff[:-1]*Deff[1:] / (Deff[:-1]+Deff[1:] + 1e-16)) * (ce_real[1:] - ce_real[:-1]) / ((self.dx_vec[:-1] + self.dx_vec[1:]) / 2.0)
+        div_J = -(torch.cat([torch.zeros(1, device=self.device), flux, torch.zeros(1, device=self.device)])[1:] - torch.cat([torch.zeros(1, device=self.device), flux, torch.zeros(1, device=self.device)])[:-1]) / self.dx_vec
+        src_e = torch.zeros_like(ce_real); src_e[:self.Nx_n], src_e[-self.Nx_p:] = (1-lp('t_plus'))/(lp('A')*lp('F')) * I_app / lp('Ln'), -(1-lp('t_plus'))/(lp('A')*lp('F')) * I_app / lp('Lp')
+        
+        Q_gen = I_app * (self.calculate_ocp(theta_p, 'cathode') - self.calculate_ocp(theta_n, 'anode') - I_app*0.02)
+        
+        dY_chem = torch.cat([dcs_n.view(-1), dcs_p.view(-1), (div_J + src_e).view(-1), torch.zeros(self.Nsei, device=self.device), dLsei_dt.view(-1)])
+        return dY_chem, Q_gen
+
+# ==========================================
+# 6. MODULAR IMPLICIT SOLVER
+# ==========================================
+
+class ImplicitPackSolver:
+    def __init__(self, chemistry_choice, config, disc):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.chem = get_lithium_ion_chen2020()
+        self.n_series, self.n_parallel = config['n_series'], config['n_parallel']
+        self.n_cells = self.n_series * self.n_parallel
+        self.raw_params = [self.chem['params'].copy() for _ in range(self.n_cells)]
+        
+        # 1. Init Modules
+        self.physics = BatteryPhysics(disc, self.chem, self.raw_params, self.device)
+        self.bms = self._init_bms(config.get('bms_type', 'None')).to(self.device)
+        self.thermal = self._init_thermal(config.get('thermal_type', 'Ambient')).to(self.device)
+        
+        self.y = self._init_state(disc, self.raw_params).to(self.device)
+        self.Gth = self._build_thermal_connection_matrix().to(self.device)
+        
+        def s(p, k, d): return p.get(k, d)() if callable(p.get(k, d)) else p.get(k, d)
+        self.Cth = torch.tensor([s(p, 'rho_Cp', 1.5e6)*s(p, 'Vol_cell', 1.5e-5) for p in self.raw_params], device=self.device).reshape(-1,1)
+        self.scale = torch.ones(self.y.shape[1], device=self.device)
+        self.scale[:self.physics.Nr_n] = 30000.0; self.scale[self.physics.Nr_n:self.physics.Nr_n+self.physics.Nr_p] = 30000.0; self.scale[-1] = 300.0
+
+    def _init_bms(self, typ):
+        if typ == 'Passive': return PassiveBalancing(R_bleed=5.0, V_thresh=4.0)
+        if typ == 'ActiveCap': return ActiveCapacitorBalancing(R_eq=0.1)
+        if typ == 'ActiveInd': return ActiveInductorBalancing(transfer_gain=1.5)
+        return BMSStrategy()
+        
+    def _init_thermal(self, typ):
+        if typ == 'Ambient': return AmbientConvection()
+        if typ == 'Liquid': return ActiveLiquidCooling(hA_contact=2.5, m_dot_Cp=5.0)
+        if typ == 'PCM': return PCMCooling(T_melt=308.15) # Melts at 35 Celsius
+        return AmbientConvection()
+
+    def _init_state(self, disc, params):
+        y = torch.zeros(self.n_cells, self.physics.Nr_n + self.physics.Nr_p + self.physics.Nel + self.physics.Nsei + 2)
+        for i, p in enumerate(params):
+            y[i, :disc['Nr_n']] = p['cs_n_init']; y[i, disc['Nr_n']:disc['Nr_n']+disc['Nr_p']] = p['cs_p_init']
+            y[i, disc['Nr_n']+disc['Nr_p'] : disc['Nr_n']+disc['Nr_p']+self.physics.Nel] = self.physics.eps_vec.cpu() * p['ce_0']
+            y[i, -2], y[i, -1] = p['Lsei_0'], p['T_amb']
+        return y
+
+    def _build_thermal_connection_matrix(self):
+        G = torch.zeros((self.n_cells, self.n_cells))
+        for s in range(self.n_series):
+            for p in range(self.n_parallel):
+                idx = s * self.n_parallel + p
+                if p < self.n_parallel-1: G[idx, idx+1] = G[idx+1, idx] = 0.5
+                if s < self.n_series-1: G[idx, idx+self.n_parallel] = G[idx+self.n_parallel, idx] = 0.5
+        return G
+
+    def get_exact_terminal_voltages(self, y_b, I_p_val):
+        I_c = self.solve_current_distribution(y_b, I_p_val)
+        OCV, R, I0n, I0p, T, Vc = self.physics.get_circuit_parameters(y_b)
+        RTF = 2 * 8.314 * T / 96485.33
+        return (OCV - I_c*R - RTF*(torch.asinh(I_c/(2*I0n+1e-12))+torch.asinh(I_c/(2*I0p+1e-12))) - Vc).flatten()
+
+    def solve_current_distribution(self, y, I_p_val):
+        if self.n_cells == 1: return torch.tensor([[I_p_val]], device=self.device)
+        OCV, R, I0n, I0p, T, Vc = [x.view(self.n_series, self.n_parallel) for x in self.physics.get_circuit_parameters(y)]
+        I_g = torch.full_like(OCV, I_p_val / self.n_parallel); RTF = 8.314 * T / 96485.33 
+        for _ in range(5): 
+            Rd = R + (2*RTF)/torch.sqrt(I_g**2 + (2*I0n)**2 + 1e-12) + (2*RTF)/torch.sqrt(I_g**2 + (2*I0p)**2 + 1e-12)
+            V_c = OCV - I_g*R - 2*RTF*torch.asinh(I_g/(2*I0n+1e-12)) - 2*RTF*torch.asinh(I_g/(2*I0p+1e-12)) - Vc
+            I_g = ((V_c + I_g*Rd) - (torch.sum((V_c+I_g*Rd)/Rd, 1, True)-I_p_val)/torch.sum(1.0/Rd, 1, True)) / Rd
+        return I_g.view(self.n_cells, 1)
+
+    def newton_step(self, y_c, dt, I_a, tol=1e-6, max_iter=15):
+        y_n = y_c.clone(); invS = 1.0 / self.scale
+        
+        # Operator Splitting: Compute BMS balancing currents externally at the start of step
+        with torch.no_grad():
+            V_c = self.get_exact_terminal_voltages(y_c, I_a).unsqueeze(1)
+            I_balance = self.bms.compute_balancing_currents(V_c, I_a)
+            I_total_cells = self.solve_current_distribution(y_c, I_a) + I_balance
+            
+        def compute_full_derivatives(y_state):
+            dY_chems = []; Q_gens = []
+            for i in range(self.n_cells):
+                dy, q = self.physics.compute_cell_derivatives(y_state[i], I_total_cells[i, 0], {k: (v[i] if not isinstance(v, list) else v[i]) for k, v in self.physics.params.items()})
+                dY_chems.append(dy); Q_gens.append(q)
+            
+            dY_chems = torch.stack(dY_chems)
+            Q_gens = torch.stack(Q_gens).view(-1, 1) # Fixed 3D tensor issue
+            T_cells = y_state[:, -1:]
+            
+            # Module thermal derivative execution
+            dT_dt = self.thermal.compute_temperatures(T_cells, Q_gens, self.Cth, self.Gth, dt)
+            return torch.cat([dY_chems, dT_dt], dim=1)
+
+        def compute_single_cell_residual(ys, i):
+            if self.n_cells > 1:
+                # Build full pack state without inplace operations to support jacrev shape inference
+                y_full = torch.cat([y_n[:i].detach(), ys.unsqueeze(0), y_n[i+1:].detach()], dim=0)
+            else:
+                y_full = ys.unsqueeze(0)
+            dY_full = compute_full_derivatives(y_full)
+            return ys - y_c[i] - dt * dY_full[i]
+
+        for k in range(max_iter):
+            dY = compute_full_derivatives(y_n)
+            R = y_n - y_c - dt*dY
+            if torch.norm(R * invS, p=float('inf')) < tol: return y_n, True
+            try:
+                # Block diagonal jacobian incorporating thermal cross-talk safely
+                J = torch.stack([torch.func.jacrev(compute_single_cell_residual, argnums=0)(y_n[i], i) for i in range(self.n_cells)])
+                J += torch.eye(J.shape[-1], device=self.device) * 1e-9
+                y_n = y_n + torch.linalg.solve(J, -R)
+            except torch.linalg.LinAlgError: return y_n, False
+        return y_n, False
+
+    def compute_step_lte(self, y_c, dt, I_a, abstol=1e-5, reltol=1e-3):
+        """
+        Calculates Local Truncation Error using Step Doubling (Richardson Extrapolation).
+        Returns the accepted state, the normalized error, and a success flag.
+        """
+        # 1. Take one FULL step (dt)
+        y_full, success_full = self.newton_step(y_c, dt, I_a)
+        if not success_full:
+            return None, float('inf'), False
+            
+        # 2. Take two HALF steps (dt/2)
+        dt_half = dt / 2.0
+        y_half_1, success_h1 = self.newton_step(y_c, dt_half, I_a)
+        if not success_h1:
+            return None, float('inf'), False
+            
+        y_half_2, success_h2 = self.newton_step(y_half_1, dt_half, I_a)
+        if not success_h2:
+            return None, float('inf'), False
+            
+        # 3. Calculate the Local Truncation Error (LTE)
+        # For Backward Euler (1st order), the error is roughly the difference between the steps.
+        lte_raw = torch.abs(y_half_2 - y_full)
+        
+        # 4. Normalize the error using scaled tolerances
+        # Error threshold = abstol + reltol * |Y|
+        # We use scale factors to ensure variables like SEI thickness (1e-8) don't dominate
+        weight = abstol * self.scale + reltol * torch.abs(y_half_2)
+        
+        # Calculate the maximum normalized error across all states and cells
+        error_norm = torch.max(lte_raw / weight).item()
+        
+        # Return the HALF step result, as it is mathematically more accurate than the full step
+        return y_half_2, error_norm, True
+
+    def simulate(self, t_end, dt_init, ctrl):
+        t, dt = 0.0, dt_init
+        times, y_hist, I_hist = [0.0], [self.y.clone().cpu()], [float(ctrl.max_i)]
+        print(f"Starting rigorous simulation: {self.bms.__class__.__name__} | {self.thermal.__class__.__name__}")
+        
+        # PID Controller Parameters
+        safety_factor = 0.9    # S: Keeps us slightly below the absolute maximum step size
+        dt_max = 10.0          # Maximum allowed time step (seconds)
+        dt_min = 1e-5          # Minimum allowed time step to prevent infinite loops
+        
+        while t < t_end:
+            # Explicitly calculate current distribution based on the state AT THE START of the step
+            I_n = ctrl.compute_current(t, self.y, self, dt)
+            
+            # Attempt the step with Error Estimation
+            y_new, err, success = self.compute_step_lte(self.y, dt, I_n)
+            
+            if success:
+                if err <= 1.0:
+                    # == STEP ACCEPTED ==
+                    # The error is within our tolerances. 
+                    self.y = y_new
+                    t += dt
+                    
+                    times.append(t)
+                    y_hist.append(self.y.clone().cpu())
+                    I_hist.append(I_n)
+                    
+                    # Calculate new step size (I-Controller)
+                    # For Backward Euler (p=1), the formula is: dt_new = dt * S * (1/err)^(1/2)
+                    dt_factor = safety_factor * (1.0 / (err + 1e-10))**0.5
+                    
+                    # Clamp the change to prevent wild swings (e.g., max 2x increase)
+                    dt_factor = max(0.2, min(2.0, dt_factor))
+                    dt = min(dt * dt_factor, dt_max)
+                    
+                    if len(times) % 10 == 0:
+                        v_pack = torch.mean(self.get_exact_terminal_voltages(self.y, I_n)).item()
+                        t_max = torch.max(self.y[:,-1]).item() - 273.15
+                        print(f"[{ctrl.current_stage}] t={t:.1f}s | dt={dt:.2f}s | Err={err:.3f} | Avg V={v_pack:.3f}V | Max T={t_max:.1f}C")
+                else:
+                    # == STEP REJECTED (Physics too fast) ==
+                    # The Newton solver succeeded, but the integration error is too high.
+                    # We do NOT advance time. We shrink dt and try again.
+                    dt_factor = safety_factor * (1.0 / err)**0.5
+                    # Clamp how drastically we shrink to prevent crashing
+                    dt_factor = max(0.2, dt_factor)
+                    dt = max(dt * dt_factor, dt_min)
+                    
+            else:
+                # == NEWTON SOLVER FAILED ==
+                # Matrix inversion failed or it didn't converge in 15 iterations.
+                dt *= 0.5
+                if dt <= dt_min:
+                    print("ERROR: Minimum time step reached. Physics are too stiff to converge.")
+                    break
+                    
+        self.process_results(times, y_hist, I_hist)
+
+    def process_results(self, times, y_list, I_h):
+        times, y, I_h = np.array(times), torch.stack(y_list).cpu().numpy(), np.array(I_h)
+        n_c = self.n_cells
+        
+        res = {'TermV': np.zeros((len(times), n_c)), 'Temp': np.zeros((len(times), n_c)), 'SOC': np.zeros((len(times), n_c))}
+        res['PV'] = np.zeros(len(times))
+        
+        for i in range(len(times)):
+            y_t = torch.from_numpy(y[i]).to(self.device)
+            I_c = self.solve_current_distribution(y_t, float(I_h[i]))
+            I_bal = self.bms.compute_balancing_currents(self.get_exact_terminal_voltages(y_t, float(I_h[i])).unsqueeze(1), float(I_h[i]))
+            I_tot = (I_c + I_bal).cpu().numpy().flatten()
+            
+            for k in range(n_c):
+                res['Temp'][i,k] = y[i,k,-1] - 273.15
+                res['SOC'][i,k] = y[i,k,self.physics.Nr_n-1] / self.physics.params['cs_max_n'][0].item()
+                
+            res['TermV'][i] = self.get_exact_terminal_voltages(y_t, float(I_h[i])).cpu().numpy()
+            res['PV'][i] = np.sum(np.mean(res['TermV'][i].reshape(self.n_series, self.n_parallel), 1))
+            
+        fig, axes = plt.subplots(3, 1, figsize=(10, 15), constrained_layout=True)
+        
+        axes[0].plot(times, res['PV'], 'k', label='Pack Voltage'); ax2 = axes[0].twinx(); ax2.plot(times, I_h, 'r--', label='Pack Current')
+        axes[0].set_ylabel('Pack Voltage (V)'); ax2.set_ylabel('Current (A)', color='r'); axes[0].legend()
+        
+        for k in range(n_c): axes[1].plot(times, res['TermV'][:,k], label=f'Cell {k} V')
+        axes[1].set_ylabel('Cell Voltages (V)'); axes[1].legend()
+        
+        for k in range(n_c): axes[2].plot(times, res['Temp'][:,k], label=f'Cell {k} Temp')
+        axes[2].set_ylabel('Cell Temperature (°C)'); axes[2].legend()
+        
+        plt.show()
+
+# ==========================================
+# 7. CONTROLLER & RUNNER
+# ==========================================
+
+class BatteryTestController:
+    def __init__(self, n_parallel, chemistry_data, mode='CTCV', target_c_rate=1.0):
+        p = chemistry_data['params']
+        def s(k): return p[k]() if callable(p[k]) else p[k]
+        self.max_i, self.target_v, self.cutoff_v = target_c_rate * s('nominal_cap') * n_parallel, s('v_max'), s('v_min')
+        self.current_stage, self.last_i = "DISCHARGE", 0.0
+        
+    def compute_current(self, t, y_s, solver, dt):
+        v_c = solver.get_exact_terminal_voltages(y_s, self.last_i)
+        mx, mn = torch.max(v_c).item(), torch.min(v_c).item()
+        if self.current_stage == "DISCHARGE":
+            if mn <= self.cutoff_v: self.current_stage = "CHARGE_CC"
+            current = self.max_i * 0.5
+        elif self.current_stage == "CHARGE_CC":
+            if mx >= self.target_v: self.current_stage = "CHARGE_CV"
+            current = -self.max_i
+        else: 
+            current = -max(0.0, self.last_i + ((self.target_v - mx) * 50.0))
+        self.last_i = current; return current
+
+if __name__ == "__main__":
+    # Test Config - Feel free to change BMS and Thermal Types!
+    # bms_type: 'None', 'Passive', 'ActiveCap', 'ActiveInd'
+    # thermal_type: 'Ambient', 'Air', 'Liquid', 'PCM'
+    
+    config = {
+        'n_series': 3, 
+        'n_parallel': 1,
+        'bms_type': 'Passive', 
+        'thermal_type': 'Liquid' 
+    }
+    
+    disc = {'Nr_n': 100, 'Nr_p': 100, 'Nx_n': 50, 'Nx_s': 50, 'Nx_p': 50, 'Nsei': 5}
+    
+    # Introduce an artificial initialization imbalance to test balancing
+    model = ImplicitPackSolver("Li-ion", config, disc)
+    model.y[0, :disc['Nr_n']] *= 0.75 # Cell 0 starts slightly lower
+    
+    ctrl = BatteryTestController(config['n_parallel'], model.chem, target_c_rate=2.0)
+    model.simulate(t_end=3600, dt_init=1.0, ctrl=ctrl)
