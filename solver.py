@@ -57,7 +57,7 @@ class BasicSolver:
             alpha = 1.0
             for _ in range(5):
                 y_test = y_next + alpha * delta_y
-                if torch.any(y_test[:, :-1] < 0): 
+                if torch.any(y_test[:, self.battery.nonnegative_mask] < 0):
                     alpha *= 0.5
                     continue
                 dY_test = self.battery.physics.batched_derivatives(y_test, I_app, y_curr, dt)
@@ -169,6 +169,9 @@ class BasicSolver:
         return {"TermV": V_term, "OCV": OCV, "Rxn": V_rxn, "OhmSolid": V_ohm_solid, "OhmElec": V_ohm_elec, "Conc": V_conc, "SEI": V_sei}
 
     def process_results(self, times, y_list, I_pack):
+        self.battery.output_manager.save(times, y_list, I_pack, filename='all_results.csv')
+        print("Saved all_results.csv")
+
         times = np.array(times)
         y = torch.stack(y_list).numpy()
         n_steps = len(times)
@@ -282,7 +285,7 @@ class AdvancedSolver:
             alpha = 1.0
             for _ in range(5):
                 y_test = y_next + alpha * delta_y
-                if torch.any(y_test[:, :-1] < 0): 
+                if torch.any(y_test[:, self.battery.nonnegative_mask] < 0):
                     alpha *= 0.5
                     continue
                 dY_test = self.battery.physics.batched_derivatives(y_test, I_app, y_curr, dt)
@@ -438,6 +441,9 @@ class AdvancedSolver:
         return {"TermV": V_term, "OCV": OCV, "Rxn": V_rxn, "OhmSolid": V_ohm_solid, "OhmElec": V_ohm_elec, "Conc": V_conc, "SEI": V_sei}
 
     def process_results(self, times, y_list, I_pack):
+        self.battery.output_manager.save(times, y_list, I_pack, filename='all_results.csv')
+        print("Saved all_results.csv")
+
         times = np.array(times)
         y = torch.stack(y_list).numpy()
         n_steps = len(times)
@@ -552,6 +558,9 @@ class ControlledSolver:
         self.process_results(times, y_hist, I_pack_hist)
 
     def process_results(self, times, y_list, I_pack_hist):
+        self.battery.output_manager.save(times, y_list, I_pack_hist, filename='all_results.csv')
+        print("Saved all_results.csv")
+
         times = np.array(times)
         y = torch.stack(y_list).numpy()
         I_pack_hist = np.array(I_pack_hist)

@@ -1,3 +1,4 @@
+# Move CycleController below imports and other controllers
 import numpy as np
 import torch
 
@@ -178,7 +179,6 @@ class MPCBatteryController(BaseController):
 
 def build_controller(strategy, **kwargs):
     strategy = strategy.lower()
-
     if strategy == "constant_current":
         return ConstantCurrentController(**kwargs)
     if strategy == "current_profile":
@@ -187,7 +187,71 @@ def build_controller(strategy, **kwargs):
         return CCCVController(**kwargs)
     if strategy == "mpc":
         return MPCBatteryController(**kwargs)
-
+    if strategy == "cycle_cccv":
+        return CycleController(**kwargs)
     raise ValueError(
-        "Unknown controller strategy. Use 'constant_current', 'current_profile', 'cc_cv', or 'mpc'."
+        "Unknown controller strategy. Use 'constant_current', 'current_profile', 'cc_cv', 'mpc', or 'cycle_cccv'."
     )
+
+# Place CycleController at the end, after all imports and other classes
+
+class CycleController(BaseController):
+    def __init__(self, cc_current=-5.0, cv_voltage=4.2, cutoff_current=1.0, discharge_current=10.0, min_voltage=2.4, max_voltage=4.2, n_cycles=3, **kwargs):
+        super().__init__(initial_current=cc_current, min_voltage=min_voltage, max_voltage=max_voltage, stop_on_voltage_limits=False, **kwargs)
+        self.cc_current = float(cc_current)
+        self.cv_voltage = float(cv_voltage)
+        self.cutoff_current = float(cutoff_current)
+        self.discharge_current = float(discharge_current)
+        self.n_cycles = int(n_cycles)
+        self.cycle_count = 0
+        self.stage = "CHARGE"  # or "DISCHARGE"
+        self.current_stage = "CC"
+
+    def compute_current(self, t, y_state, model_solver, dt_sim):
+        cell_voltages = model_solver.get_exact_terminal_voltages(y_state, self.cc_current if self.stage == "CHARGE" else self.discharge_current)
+        max_voltage = torch.max(cell_voltages).item()
+        min_voltage = torch.min(cell_voltages).item()
+
+        # Charging stage
+        if self.stage == "CHARGE":
+            if self.current_stage == "CC" and max_voltage >= self.cv_voltage:
+                print(f"[{t:.1f}s] Switching to CV mode.")
+                self.current_stage = "CV"
+            if self.current_stage == "CC":
+                return self.cc_current
+            # CV mode
+            voltage_error = self.cv_voltage - max_voltage
+            current_magnitude = min(abs(self.cc_current), max(0.0, 40.0 * max(voltage_error, 0.0)))
+            return -current_magnitude
+        # Discharge stage
+        else:
+            return self.discharge_current
+
+    def should_stop(self, t, y_state, cell_voltages, pack_current):
+        max_voltage = torch.max(cell_voltages).item()
+        min_voltage = torch.min(cell_voltages).item()
+
+        # Charging stage
+        if self.stage == "CHARGE":
+            # Stop charge if CV current is low or max voltage exceeded
+            if self.current_stage == "CV" and abs(pack_current) <= self.cutoff_current:
+                print(f"[{t:.1f}s] Charge complete (CV current below cutoff). Switching to discharge.")
+                self.stage = "DISCHARGE"
+                self.current_stage = "CC"
+                return False, "Switching to discharge."
+            if max_voltage >= self.max_voltage:
+                print(f"[{t:.1f}s] Max voltage reached. Switching to discharge.")
+                self.stage = "DISCHARGE"
+                self.current_stage = "CC"
+                return False, "Switching to discharge."
+        # Discharge stage
+        else:
+            if min_voltage <= self.min_voltage:
+                self.cycle_count += 1
+                print(f"[{t:.1f}s] Discharge complete (min voltage reached). Cycle {self.cycle_count}/{self.n_cycles}.")
+                if self.cycle_count >= self.n_cycles:
+                    return True, f"Completed {self.n_cycles} cycles."
+                self.stage = "CHARGE"
+                self.current_stage = "CC"
+                return False, f"Starting cycle {self.cycle_count + 1}."
+        return False, ""

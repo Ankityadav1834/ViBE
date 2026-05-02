@@ -63,6 +63,7 @@ class StateFieldSpec:
     size: int
     initial: object = 0.0
     scale: object = 1.0
+    nonnegative: bool = True
 
 
 class StateLayout:
@@ -77,7 +78,7 @@ class StateLayout:
         self.slices = {}
         self.total_size = 0
 
-    def register(self, name, size, initial=0.0, scale=1.0):
+    def register(self, name, size, initial=0.0, scale=1.0, nonnegative=True):
         if name in self.slices:
             raise ValueError(f"State field {name!r} is already registered.")
         size = int(size)
@@ -85,7 +86,7 @@ class StateLayout:
             raise ValueError(f"State field {name!r} must have positive size.")
         start = self.total_size
         stop = start + size
-        self.fields.append(StateFieldSpec(name, size, initial, scale))
+        self.fields.append(StateFieldSpec(name, size, initial, scale, bool(nonnegative)))
         self.slices[name] = slice(start, stop)
         self.total_size = stop
         return self.slices[name]
@@ -150,6 +151,13 @@ class StateLayout:
             value = self._resolve_value(field.scale, {}, device, dtype)
             scale[self.slices[field.name]] = self._expand_field_value(field, value)
         return scale
+
+    def nonnegative_mask(self, device):
+        mask = torch.zeros(self.total_size, device=device, dtype=torch.bool)
+        for field in self.fields:
+            if field.nonnegative:
+                mask[self.slices[field.name]] = True
+        return mask
 
 
 class CompositeMesh:

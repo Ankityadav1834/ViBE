@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import time
 import pandas as pd
 from initial_states import get_hardcoded_discharged_state
+from output_manager import SimulationOutputManager
 from pack_modules import build_balancing_module, build_thermal_module
 from pde_framework import CompositeMesh, ChebyshevRegionOperators, ElectrolytePDEModel, FiniteVolumeOperators, StateLayout
 from solver import BasicSolver, AdvancedSolver, ControlledSolver
@@ -52,6 +53,9 @@ class BatteryPhysics(torch.nn.Module):
         self.electrolyte_mesh = self._build_electrolyte_mesh(p0)
         self.electrolyte_operators = self._build_electrolyte_operators()
         self.electrolyte_model = ElectrolytePDEModel(self.electrolyte_mesh, self.electrolyte_operators)
+        self.stress_options = config.get('stress_options', {})
+        self.stress_enabled = bool(self.stress_options.get('enabled', True))
+        self.stress_model = ElectrolytePDEModel(self.electrolyte_mesh, self.electrolyte_operators) if self.stress_enabled else None
         self.state_layout = self._build_state_layout(config)
         self.state_size = self.state_layout.total_size
         
@@ -62,7 +66,8 @@ class BatteryPhysics(torch.nn.Module):
             'Dsolv','kappa_sei','Msei','rho_sei','Us','kf','beta',
             'm_ref_n', 'm_ref_p', 'sigma_n', 'sigma_p', 
             'E_r_n', 'E_r_p', # Activation Energies
-            'Vol_cell', 'rho_Cp', 'hA', 'T_amb' , 'eps_e_n' , 'eps_e_s' , 'eps_e_p' 
+            'Vol_cell', 'rho_Cp', 'hA', 'T_amb' , 'eps_e_n' , 'eps_e_s' , 'eps_e_p',
+            'ce_0'
         ]
         
         self.params = {}
@@ -81,12 +86,22 @@ class BatteryPhysics(torch.nn.Module):
             scale=1000.0,
         )
 
+        if self.stress_enabled:
+            layout.register(
+                'stress',
+                self.Nel,
+                initial=self.stress_options.get('initial', 0.0),
+                scale=self.stress_options.get('scale', 1e6),
+                nonnegative=False,
+            )
+
         for field in config.get('extra_state_fields', []):
             layout.register(
                 field['name'],
                 field['size'],
                 initial=field.get('initial', 0.0),
                 scale=field.get('scale', 1.0),
+                nonnegative=field.get('nonnegative', False),
             )
 
         layout.register('sei', self.Nsei, initial=0.0, scale=1.0)
@@ -96,6 +111,22 @@ class BatteryPhysics(torch.nn.Module):
 
     def state(self, y, name):
         return self.state_layout.get(y, name)
+
+    def _evaluate_stress_rhs(self, stress, ce_state, p):
+        diffusivity = torch.ones_like(stress) * float(self.stress_options.get('diffusivity', 1e-12))
+        relaxation = float(self.stress_options.get('relaxation', 1e-4))
+        coupling = float(self.stress_options.get('coupling', 1.0))
+        source = coupling * (ce_state - p['ce_0']) - relaxation * stress
+
+        flux_coefficient = -diffusivity
+        if self.discretization_methods['electrolyte'] == 'finite_volume':
+            flux_coefficient = lambda ctx, coeff=diffusivity: -ctx.operators.face_coefficients(coeff)
+
+        return self.stress_model.evaluate(
+            stress,
+            flux_coefficient=flux_coefficient,
+            source=source,
+        )
 
     def _build_electrolyte_mesh(self, p0):
         region_spec = {
@@ -424,6 +455,8 @@ class BatteryPhysics(torch.nn.Module):
             'Lsei': dLsei_dt,
             'temperature': dT_dt,
         }
+        if self.stress_enabled:
+            derivatives['stress'] = self._evaluate_stress_rhs(self.state(y_flat, 'stress'), ce_state, p)
         return self.state_layout.pack(derivatives, device=self.device, dtype=y_flat.dtype)
 
     def batched_derivatives(self, y_batch, I_batch, y_old_batch=None, dt=None):
@@ -470,10 +503,12 @@ class ImplicitBatterySolver:
         self.thermal_module = build_thermal_module(**self.thermal_options)
 
         self.scale = self.physics.state_layout.scale_vector(self.device, torch.float64)
+        self.nonnegative_mask = self.physics.state_layout.nonnegative_mask(self.device)
 
         self.basic_solver = BasicSolver(self)
         self.advanced_solver = AdvancedSolver(self)
         self.controlled_solver = ControlledSolver(self)
+        self.output_manager = SimulationOutputManager(self)
         self.y = self._build_initial_state(discretization, self.raw_params).to(self.device)
 
     def _create_fully_charged_state(self, disc, params):

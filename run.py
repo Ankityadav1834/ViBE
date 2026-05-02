@@ -4,8 +4,50 @@ from controllers import build_controller
 # Configuration for the battery pack
 config = {
     'n_series': 4,      # Number of cells in series
-    'n_parallel': 4   # Number of cells in parallel
+    'n_parallel': 2,   # Number of cells in parallel
+    'stress_options': {
+        'enabled': True,      # Set True to add the example stress PDE state.
+        'initial': 0.0,        # Initial stress-like field value [Pa]
+        'scale': 1e6,          # Newton scaling for stress [Pa]
+        'diffusivity': 1e-12,  # Stress smoothing coefficient
+        'relaxation': 1e-4,    # Stress relaxation rate [1/s]
+        'coupling': 1.0,       # Source strength from electrolyte concentration deviation
+        'force_area': 0.1027   # Area used for derived force_from_stress output
+    }
 }
+
+# Controller settings
+controller_config = {
+    'constant_current': {
+        'current': 15.0
+    },
+    'current_profile': {
+        'time_points': [0.0, 600.0, 1200.0, 1800.0, 2400.0, 3000.0, 3600.0, 4200.0, 4800.0, 5400.0, 6000.0, 6600.0, 7000.0],
+        'current_points': [-30.0, 50.0, 100.0, 0.0, -100.0, 50.0, -30.0, 80.0, -80.0, 20.0, -20.0, 0.0, -50.0]
+    },
+    'cc_cv': {
+        'cc_current': -25.0,
+        'cv_voltage': 4.2,
+        'cutoff_current': 1.0
+    },
+    'mpc': {
+        'n_parallel': config['n_parallel'],
+        't_limit': 313.15,
+        'target_c_rate': 2.0
+    },
+    'cycle_cccv': {
+        'cc_current': -15.0,         # Charging current (A)
+        'cv_voltage': 4.2,          # CV voltage (V)
+        'cutoff_current': 1.0,      # Cutoff current for CV (A)
+        'discharge_current': 10.0,  # Discharge current (A)
+        'min_voltage': 2.4,         # Discharge cutoff voltage (V)
+        'max_voltage': 4.2,         # Charge cutoff voltage (V)
+        'n_cycles': 200               # Number of cycles
+    }
+}
+
+solver_method = 'basic'   # 'basic' or 'advanced'
+pack_current = 20.0
 
 # Discretization parameters
 discretization = {
@@ -18,7 +60,7 @@ discretization = {
 }
 
 # Parameter overrides (if any)
-overrides = {}  # e.g., {(0,0): {'T_amb': 308.15}} for cell 0,0
+overrides = {(2,2): {'hA_ambient': 0.0931}}  # e.g., {(0,0): {'T_amb': 308.15}} for cell 0,0
 
 # Initial state selection
 initial_state_mode = 'fully_charged'   # 'fully_charged' or 'fully_discharged'
@@ -66,48 +108,25 @@ battery_solver = ImplicitBatterySolver(
     thermal_options=thermal_options
 )
 
-# Simulation mode selection
-use_controller = False
-
-# Non-controller settings
-solver_method = 'basic'   # 'basic' or 'advanced'
-pack_current = 20.0
-
-# Controller settings
-controller_strategy = 'current_profile'   # 'constant_current', 'current_profile', 'cc_cv', 'mpc'
-controller_dt_max = 5.0
-
-controller_config = {
-    'constant_current': {
-        'current': 15.0
-    },
-    'current_profile': {
-        'time_points': [0.0, 600.0, 1200.0, 1800.0, 2400.0, 3000.0, 3600.0, 4200.0, 4800.0, 5400.0, 6000.0, 6600.0, 7000.0],
-        'current_points': [-30.0, 50.0, 100.0, 0.0, -100.0, 50.0, -30.0, 80.0, -80.0, 20.0, -20.0, 0.0, -50.0]
-    },
-    'cc_cv': {
-        'cc_current': -25.0,
-        'cv_voltage': 4.2,
-        'cutoff_current': 1.0
-    },
-    'mpc': {
-        'n_parallel': config['n_parallel'],
-        't_limit': 313.15,
-        'target_c_rate': 2.0
-    }
-}
+"""
+Simulation mode selection
+Set use_controller = True and controller_strategy = 'cycle_cccv' to enable cycling mode.
+"""
+use_controller = True
+controller_strategy = 'cycle_cccv'   # 'constant_current', 'current_profile', 'cc_cv', 'mpc', 'cycle_cccv'
+controller_dt_max = 50.0
 
 if use_controller:
     controller = build_controller(controller_strategy, **controller_config[controller_strategy])
     battery_solver.simulate(
-        t_end=7200,
+        t_end=3600000,  # Large enough to allow all cycles
         dt_init=1.0,
         controller=controller,
         dt_max=controller_dt_max
     )
 else:
     battery_solver.simulate(
-        t_end=3600,
+        t_end=500,
         dt_init=1.0,
         I_pack=pack_current,
         method=solver_method
