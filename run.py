@@ -3,10 +3,10 @@ from controllers import build_controller
 
 # Configuration for the battery pack
 config = {
-    'n_series': 4,      # Number of cells in series
-    'n_parallel': 2,   # Number of cells in parallel
+    'n_series': 2,      # Number of cells in series
+    'n_parallel': 1,   # Number of cells in parallel
     'stress_options': {
-        'enabled': True,      # Set True to add the example stress PDE state.
+        'enabled': False,      # Set True to add the example stress PDE state.
         'initial': 0.0,        # Initial stress-like field value [Pa]
         'scale': 1e6,          # Newton scaling for stress [Pa]
         'diffusivity': 1e-12,  # Stress smoothing coefficient
@@ -36,18 +36,18 @@ controller_config = {
         'target_c_rate': 2.0
     },
     'cycle_cccv': {
-        'cc_current': -15.0,         # Charging current (A)
+        'cc_current': -10.0,         # Charging current (A)
         'cv_voltage': 4.2,          # CV voltage (V)
         'cutoff_current': 1.0,      # Cutoff current for CV (A)
         'discharge_current': 10.0,  # Discharge current (A)
         'min_voltage': 2.4,         # Discharge cutoff voltage (V)
-        'max_voltage': 4.2,         # Charge cutoff voltage (V)
-        'n_cycles': 200               # Number of cycles
+        'max_voltage': 4.4,         # Charge cutoff voltage (V)
+        'n_cycles': 50             # Number of cycles
     }
 }
 
-solver_method = 'basic'   # 'basic' or 'advanced'
-pack_current = 20.0
+solver_method = 'advanced'   # 'basic' or 'advanced'
+pack_current = 5.0
 
 # Discretization parameters
 discretization = {
@@ -60,7 +60,7 @@ discretization = {
 }
 
 # Parameter overrides (if any)
-overrides = {(2,2): {'hA_ambient': 0.0931}}  # e.g., {(0,0): {'T_amb': 308.15}} for cell 0,0
+overrides = {(0,0): {'hA': 0.0931}}  # e.g., {(0,0): {'T_amb': 308.15}} for cell 0,0
 
 # Initial state selection
 initial_state_mode = 'fully_charged'   # 'fully_charged' or 'fully_discharged'
@@ -75,7 +75,7 @@ initial_state_options = {
 
 # Optional pack subsystems
 balancing_options = {
-    'enabled': True,
+    'enabled': False,
     'strategy': 'passive',   # 'none', 'passive', 'active_capacitor', 'active_inductor'
     'r_bleed': 5.0,
     'v_threshold': 4.0,
@@ -126,7 +126,7 @@ if use_controller:
     )
 else:
     battery_solver.simulate(
-        t_end=500,
+        t_end=3600.0,
         dt_init=1.0,
         I_pack=pack_current,
         method=solver_method

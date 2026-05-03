@@ -77,7 +77,10 @@ class CCCVController(BaseController):
         if self.current_stage == "CC":
             return self.cc_current
 
-        voltage_error = self.cv_voltage - max_voltage
+        cell_voltages_ocv = model_solver.get_exact_terminal_voltages(y_state, 0.0)
+        max_ocv = torch.max(cell_voltages_ocv).item()
+
+        voltage_error = self.cv_voltage - max_ocv
         current_magnitude = min(abs(self.cc_current), max(0.0, self.kp * max(voltage_error, 0.0)))
         return -current_magnitude
 
@@ -220,7 +223,9 @@ class CycleController(BaseController):
             if self.current_stage == "CC":
                 return self.cc_current
             # CV mode
-            voltage_error = self.cv_voltage - max_voltage
+            cell_voltages_ocv = model_solver.get_exact_terminal_voltages(y_state, 0.0)
+            max_ocv = torch.max(cell_voltages_ocv).item()
+            voltage_error = self.cv_voltage - max_ocv
             current_magnitude = min(abs(self.cc_current), max(0.0, 40.0 * max(voltage_error, 0.0)))
             return -current_magnitude
         # Discharge stage
