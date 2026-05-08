@@ -56,6 +56,8 @@ class BatteryPhysics(torch.nn.Module):
         self.stress_options = config.get('stress_options', {})
         self.stress_enabled = bool(self.stress_options.get('enabled', True))
         self.stress_model = ElectrolytePDEModel(self.electrolyte_mesh, self.electrolyte_operators) if self.stress_enabled else None
+        
+        self.sei_enabled = config.get('sei_options', {}).get('enabled', True)
         self.state_layout = self._build_state_layout(config)
         self.state_size = self.state_layout.total_size
         
@@ -67,7 +69,7 @@ class BatteryPhysics(torch.nn.Module):
             'm_ref_n', 'm_ref_p', 'sigma_n', 'sigma_p', 
             'E_r_n', 'E_r_p', # Activation Energies
             'Vol_cell', 'rho_Cp', 'hA', 'T_amb' , 'eps_e_n' , 'eps_e_s' , 'eps_e_p',
-            'ce_0'
+            'ce_0', 'Lsei_0'
         ]
         
         self.params = {}
@@ -104,8 +106,9 @@ class BatteryPhysics(torch.nn.Module):
                 nonnegative=field.get('nonnegative', False),
             )
 
-        layout.register('sei', self.Nsei, initial=0.0, scale=1.0)
-        layout.register('Lsei', 1, initial='Lsei_0', scale=1e-8)
+        if self.sei_enabled:
+            layout.register('sei', self.Nsei, initial=0.0, scale=1.0)
+            layout.register('Lsei', 1, initial='Lsei_0', scale=1e-8)
         layout.register('temperature', 1, initial='T_amb', scale=300.0)
         return layout
 
@@ -147,7 +150,10 @@ class BatteryPhysics(torch.nn.Module):
             return ChebyshevRegionOperators(self.electrolyte_mesh)
         if method == 'finite_volume':
             return FiniteVolumeOperators(self.electrolyte_mesh)
-        raise ValueError("electrolyte_spatial_method must be 'chebyshev' or 'finite_volume'")
+        if method == 'finite_difference':
+            from pde_framework import FiniteDifferenceOperators
+            return FiniteDifferenceOperators(self.electrolyte_mesh)
+        raise ValueError("electrolyte_spatial_method must be 'chebyshev', 'finite_volume', or 'finite_difference'")
 
     def _build_cheb_operators(self, N):
         """Generates Chebyshev nodes on [0, 1] and differentiation matrices D and D2"""
@@ -247,8 +253,12 @@ class BatteryPhysics(torch.nn.Module):
         cs_n = self.state(y_batch, 'cs_n')
         cs_p = self.state(y_batch, 'cs_p')
         ce_eps = self.state(y_batch, 'electrolyte')
-        Lsei = self.state(y_batch, 'Lsei')
         T_cell = self.state(y_batch, 'temperature')
+        
+        if self.sei_enabled:
+            Lsei = self.state(y_batch, 'Lsei')
+        else:
+            Lsei = p['Lsei_0'] * torch.ones_like(T_cell)
         
         theta_n = cs_n[:, -1:] / p['cs_max_n']
         theta_p = cs_p[:, -1:] / p['cs_max_p']
@@ -295,8 +305,12 @@ class BatteryPhysics(torch.nn.Module):
         cs_n = self.state(y_flat, 'cs_n')
         cs_p = self.state(y_flat, 'cs_p')
         ce_eps = self.state(y_flat, 'electrolyte')
-        Lsei = self.state(y_flat, 'Lsei')
         T_cell = self.state(y_flat, 'temperature')
+        
+        if self.sei_enabled:
+            Lsei = self.state(y_flat, 'Lsei')
+        else:
+            Lsei = p['Lsei_0'] * torch.ones_like(T_cell)
         
         inv_T = 1.0 / T_cell
         inv_T_ref = 1.0 / 298.15
@@ -325,7 +339,47 @@ class BatteryPhysics(torch.nn.Module):
         
         term_RTF = 2 * p['R_g'] * T_cell / p['F']
         phi_s_n = Un - I_app * R_sei
-        i_side = 165.96e-6*torch.exp(-6.3e9*Lsei)*torch.exp(-0.55*p['F']*(phi_s_n-p['Us'])/(p['R_g']*T_cell))  + p['F']*(3.7398e-15/Lsei)*0.015*torch.exp(-Un*p['F']/(p['R_g']*T_cell))
+
+        # ==========================================
+        # Stress-Coupled SEI Cracking
+        # ==========================================
+        E_sei = 10e9
+        nu_sei = 0.25
+        E_sei_b = E_sei / (1.0 - nu_sei)
+        Omega = 3.17e-6
+        sigma_intr = -0.5e9
+        E_g = 15e9
+        nu_g = 0.3
+        pf = E_g * Omega / (3.0 * (1.0 - nu_g))
+
+        c_surf = cs_n[-1]
+        c_surf_ref = 0.8 * p['cs_max_n']
+
+        r_ref = self.r_n_ref
+        r_faces = torch.zeros(self.Nr_n + 1, device=self.device, dtype=torch.float64)
+        r_faces[1:-1] = 0.5 * (r_ref[:-1] + r_ref[1:])
+        r_faces[-1] = 1.0
+        v = r_faces[1:]**3 - r_faces[:-1]**3
+        cv = torch.sum(v)
+        c_bar = torch.sum(cs_n * v) / cv
+
+        sth_surf = 3.0 * pf * (c_bar - c_surf)
+        sigma_sei = E_sei_b * (Omega / 3.0) * (c_surf - c_surf_ref) + sigma_intr
+        total_surf_stress = sth_surf + sigma_sei
+
+        K_Ic = 0.3e6
+        # Threshold: K_Ic / sqrt(pi * Lsei)
+        sigma_crack_threshold = K_Ic / torch.sqrt(torch.pi * torch.clamp(Lsei, min=1e-10))
+        
+        # Smooth transition for Newton solver stability (cracks when stress > threshold)
+        crack_flag = 0.5 * (1.0 + torch.tanh((total_surf_stress - sigma_crack_threshold) / 1e5))
+        stress_enhancement = 1.0 + 3.0 * crack_flag
+
+        i_side_base = 165.96e-6*torch.exp(-6.3e9*Lsei)*torch.exp(-0.55*p['F']*(phi_s_n-p['Us'])/(p['R_g']*T_cell))  + p['F']*(3.7398e-15/Lsei)*0.015*torch.exp(-Un*p['F']/(p['R_g']*T_cell))
+        
+        # Multiply the side current by the enhancement factor to simulate fresh graphite exposure
+        i_side = i_side_base * stress_enhancement
+        
         g_side = p['as_n']*p['Ln']*p['A'] * i_side
         dLsei_dt = i_side * p['Msei'] / (2*p['F']*p['rho_sei'])
         
@@ -451,10 +505,11 @@ class BatteryPhysics(torch.nn.Module):
             'cs_n': dcs_n_out,
             'cs_p': dcs_p_out,
             'electrolyte': dce_out,
-            'sei': torch.zeros(self.Nsei, device=self.device, dtype=y_flat.dtype),
-            'Lsei': dLsei_dt,
             'temperature': dT_dt,
         }
+        if self.sei_enabled:
+            derivatives['sei'] = torch.zeros(self.Nsei, device=self.device, dtype=y_flat.dtype)
+            derivatives['Lsei'] = dLsei_dt
         if self.stress_enabled:
             derivatives['stress'] = self._evaluate_stress_rhs(self.state(y_flat, 'stress'), ce_state, p)
         return self.state_layout.pack(derivatives, device=self.device, dtype=y_flat.dtype)
@@ -552,12 +607,17 @@ class ImplicitBatterySolver:
             ('cs_n', disc['Nr_n']),
             ('cs_p', disc['Nr_p']),
             ('electrolyte', self.physics.Nel),
-            ('sei', disc['Nsei']),
-            ('Lsei', 1),
-            ('temperature', 1),
         ]:
             old_slices[name] = slice(cursor, cursor + size)
             cursor += size
+
+        if self.sei_enabled:
+            for name, size in [('sei', disc['Nsei']), ('Lsei', 1)]:
+                old_slices[name] = slice(cursor, cursor + size)
+                cursor += size
+
+        old_slices['temperature'] = slice(cursor, cursor + 1)
+        cursor += 1
 
         for name, old_slice in old_slices.items():
             if name in self.physics.state_layout:

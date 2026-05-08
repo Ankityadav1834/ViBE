@@ -36,13 +36,13 @@ controller_config = {
         'target_c_rate': 2.0
     },
     'cycle_cccv': {
-        'cc_current': -10.0,         # Charging current (A)
+        'cc_current': -20.0,         # Charging current (A)
         'cv_voltage': 4.2,          # CV voltage (V)
         'cutoff_current': 1.0,      # Cutoff current for CV (A)
-        'discharge_current': 10.0,  # Discharge current (A)
+        'discharge_current': 20.0,  # Discharge current (A)
         'min_voltage': 2.4,         # Discharge cutoff voltage (V)
         'max_voltage': 4.4,         # Charge cutoff voltage (V)
-        'n_cycles': 50             # Number of cycles
+        'n_cycles': 4           # Number of cycles
     }
 }
 

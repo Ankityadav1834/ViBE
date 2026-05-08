@@ -40,6 +40,12 @@ class Div(Expression):
 
 
 @dataclass(frozen=True)
+class SphericalDiv(Expression):
+    child: Expression
+    radius: Expression
+
+
+@dataclass(frozen=True)
 class Add(Expression):
     left: Expression
     right: Expression
@@ -199,6 +205,8 @@ class CompositeMesh:
             elif method == "chebyshev":
                 idx = torch.arange(n_nodes, device=device, dtype=dtype)
                 local_nodes = 0.5 * length * (1.0 - torch.cos(torch.pi * idx / (n_nodes - 1)))
+            elif method == "finite_difference":
+                local_nodes = torch.linspace(0.0, length, n_nodes, device=device, dtype=dtype)
             else:
                 edges = torch.linspace(0.0, length, n_nodes + 1, device=device, dtype=dtype)
                 local_nodes = 0.5 * (edges[:-1] + edges[1:])
@@ -213,6 +221,9 @@ class CompositeMesh:
                 dx_right[:-1] = local_nodes[1:] - local_nodes[:-1]
                 dx_right[-1] = local_nodes[-1] - local_nodes[-2]
                 local_dx = 0.5 * (dx_left + dx_right)
+            elif method == "finite_difference":
+                local_dx = torch.empty_like(local_nodes)
+                local_dx[:] = length / (n_nodes - 1) if n_nodes > 1 else length
             else:
                 local_dx = torch.empty_like(local_nodes)
                 local_dx[:] = length / n_nodes
@@ -251,6 +262,49 @@ class CompositeMesh:
         else:
             self.face_positions = None
             self.n_faces = self.n_nodes
+
+
+class FiniteDifferenceOperators:
+    """
+    Builds FDM operators for a stitched 1D node-centered mesh.
+    """
+
+    def __init__(self, mesh):
+        if mesh.method != "finite_difference":
+            raise ValueError("FiniteDifferenceOperators require a finite_difference mesh.")
+        self.mesh = mesh
+        self.device = mesh.nodes.device
+        self.dtype = mesh.nodes.dtype
+        self.gradient_matrix = self._build_gradient_matrix()
+        self.divergence_matrix = self._build_divergence_matrix()
+
+    def _build_gradient_matrix(self):
+        n_nodes = self.mesh.n_nodes
+        G = torch.zeros((n_nodes, n_nodes), device=self.device, dtype=self.dtype)
+        x = self.mesh.nodes
+        if n_nodes > 1:
+            for i in range(1, n_nodes - 1):
+                G[i, i-1] = -0.5 / (x[i] - x[i-1])
+                G[i, i+1] = 0.5 / (x[i+1] - x[i])
+            G[0, 0] = -1.0 / (x[1] - x[0])
+            G[0, 1] = 1.0 / (x[1] - x[0])
+            G[-1, -2] = -1.0 / (x[-1] - x[-2])
+            G[-1, -1] = 1.0 / (x[-1] - x[-2])
+        return G
+
+    def _build_divergence_matrix(self):
+        # In 1D FDM, simple divergence is same as gradient matrix
+        return self._build_gradient_matrix()
+
+    def gradient(self, values):
+        return self.gradient_matrix @ values
+
+    def divergence(self, values):
+        return self.divergence_matrix @ values
+
+    def face_coefficients(self, coefficients):
+        return coefficients
+
 
 
 class FiniteVolumeOperators:
@@ -418,6 +472,23 @@ def discretize(expr, context):
 
     if isinstance(expr, Div):
         return context.operators.divergence(discretize(expr.child, context))
+
+    if isinstance(expr, SphericalDiv):
+        r = discretize(expr.radius, context)
+        child_val = discretize(expr.child, context)
+        # Spherical Div: 1/r^2 d/dr (r^2 J)
+        # However, at r=0 it's usually handled by L'hopital.
+        # But we can just use 1/r^2 * Div(r^2 * child) or chain rule.
+        r_safe = r.clone()
+        r_safe[r_safe == 0] = 1.0
+        r_sq = r_safe ** 2
+        r_sq_child = r_sq * child_val
+        div_r_sq_child = context.operators.divergence(r_sq_child)
+        result = div_r_sq_child / r_sq
+        # L'hopital for r=0: Div(J) at r=0 is 3 * dJ/dr (for J ~ r)
+        if hasattr(context.operators, 'mesh') and context.operators.mesh.nodes[0] == 0:
+            result[0] = 3.0 * context.operators.gradient(child_val)[0]
+        return result
 
     raise TypeError(f"Unsupported expression type: {type(expr)!r}")
 

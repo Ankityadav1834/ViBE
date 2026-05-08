@@ -25,6 +25,11 @@ class SimulationOutputManager:
         self.register_output("temperature", lambda y, i: self.battery.physics.state(y, "temperature").flatten())
         self.register_output("soc", self._soc)
         self.register_output("sei_thickness_nm", lambda y, i: self.battery.physics.state(y, "Lsei").flatten() * 1e9)
+        self.register_output("capacity_fade_pct", self._capacity_fade_pct)
+        self.register_output("dis_stress_vm_peak", self._dis_stress_vm_peak)
+        self.register_output("dis_stress_th_surf", self._dis_stress_th_surf)
+        self.register_output("sei_mismatch_stress", self._sei_mismatch_stress)
+        self.register_output("total_surf_stress", self._total_surf_stress)
 
         if "stress" in self.battery.physics.state_layout:
             self.register_output("stress_mean", lambda y, i: torch.mean(self.battery.physics.state(y, "stress"), dim=1))
@@ -49,6 +54,86 @@ class SimulationOutputManager:
         cs_n = self.battery.physics.state(y, "cs_n")
         cs_max = self.battery.physics.params["cs_max_n"]
         return ((cs_n[:, -1:] / cs_max - 0.01) / 0.94).flatten()
+
+    def _capacity_fade_pct(self, y, i_pack):
+        Lsei = self.battery.physics.state(y, "Lsei")
+        p = self.battery.physics.params
+        rho_sei = p["rho_sei"]
+        Msei = p["Msei"]
+        cs_max = p["cs_max_n"]
+        Rs_n = p["Rs_n"]
+        Lsei_0 = p["Lsei_0"]
+        delta_Lsei = Lsei - Lsei_0
+        
+        # Capacity fade fraction from SEI Li consumption: 
+        # fade = 2 * (rho_sei / Msei) * delta_Lsei * (3 / Rs_n) / cs_max
+        fade = 2.0 * (rho_sei / Msei) * delta_Lsei * (3.0 / Rs_n) / cs_max
+        return (fade * 100.0).flatten()
+
+    def _get_c_bar_data(self, y):
+        cs_n = self.battery.physics.state(y, "cs_n")
+        r_ref = self.battery.physics.r_n_ref.to(self.battery.device).unsqueeze(0)
+        
+        # Construct r_faces to compute spherical volume elements
+        r_faces = torch.zeros((1, r_ref.shape[1] + 1), device=r_ref.device)
+        r_faces[:, 1:-1] = 0.5 * (r_ref[:, :-1] + r_ref[:, 1:])
+        r_faces[:, -1] = 1.0
+        
+        v = r_faces[:, 1:]**3 - r_faces[:, :-1]**3
+        cv = torch.cumsum(v, dim=1)
+        cv2 = torch.cumsum(cs_n * v, dim=1)
+        
+        c_bar_r = cv2 / cv
+        c_bar = c_bar_r[:, -1:]
+        return cs_n, c_bar_r, c_bar
+
+    def _dis_stress_vm_peak(self, y, i_pack):
+        cs_n, c_bar_r, c_bar = self._get_c_bar_data(y)
+        
+        E = 15e9
+        nu = 0.3
+        Omega = 3.17e-6
+        pf = E * Omega / (3.0 * (1.0 - nu))
+        
+        sr = 2.0 * pf * (c_bar - c_bar_r)
+        sth = pf * (2.0 * c_bar + c_bar_r - 3.0 * cs_n)
+        svm = torch.abs(sr - sth)
+        return torch.max(svm, dim=1).values.flatten()
+
+    def _dis_stress_th_surf(self, y, i_pack):
+        cs_n, c_bar_r, c_bar = self._get_c_bar_data(y)
+        
+        E = 15e9
+        nu = 0.3
+        Omega = 3.17e-6
+        pf = E * Omega / (3.0 * (1.0 - nu))
+        
+        c_surf = cs_n[:, -1]
+        c_bar_surf = c_bar.squeeze(1)
+        
+        sth_surf = pf * (2.0 * c_bar_surf + c_bar_surf - 3.0 * c_surf)
+        return sth_surf.flatten()
+
+    def _sei_mismatch_stress(self, y, i_pack):
+        cs_n = self.battery.physics.state(y, "cs_n")
+        c_surf = cs_n[:, -1]
+        c_max = self.battery.physics.params["cs_max_n"].flatten()
+        c_surf_ref = 0.8 * c_max # Reference concentration at formation
+        
+        E_sei = 10e9
+        nu_sei = 0.25
+        E_sei_b = E_sei / (1.0 - nu_sei)
+        Omega = 3.17e-6
+        sigma_intr = -0.5e9
+        
+        delta_c = c_surf - c_surf_ref
+        sigma_mism = E_sei_b * (Omega / 3.0) * delta_c + sigma_intr
+        return sigma_mism.flatten()
+
+    def _total_surf_stress(self, y, i_pack):
+        sth_surf = self._dis_stress_th_surf(y, i_pack)
+        sei_mism = self._sei_mismatch_stress(y, i_pack)
+        return (sth_surf + sei_mism).flatten()
 
     def _force_from_stress(self, y, i_pack):
         stress = self.battery.physics.state(y, "stress")
