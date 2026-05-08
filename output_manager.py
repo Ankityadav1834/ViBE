@@ -1,6 +1,8 @@
 import pandas as pd
 import torch
 
+from model_registry import DERIVED_OUTPUTS
+
 
 class SimulationOutputManager:
     """
@@ -19,23 +21,16 @@ class SimulationOutputManager:
         self.outputs[name] = fn
 
     def _register_default_outputs(self):
-        self.register_output("terminal_voltage", self._terminal_voltage)
-        self.register_output("cell_current", self._cell_current)
-        self.register_output("pack_voltage", self._pack_voltage)
-        self.register_output("temperature", lambda y, i: self.battery.physics.state(y, "temperature").flatten())
-        self.register_output("soc", self._soc)
-        self.register_output("sei_thickness_nm", lambda y, i: self.battery.physics.state(y, "Lsei").flatten() * 1e9)
-        self.register_output("capacity_fade_pct", self._capacity_fade_pct)
-        self.register_output("dis_stress_vm_peak", self._dis_stress_vm_peak)
-        self.register_output("dis_stress_th_surf", self._dis_stress_th_surf)
-        self.register_output("sei_mismatch_stress", self._sei_mismatch_stress)
-        self.register_output("total_surf_stress", self._total_surf_stress)
-
-        if "stress" in self.battery.physics.state_layout:
-            self.register_output("stress_mean", lambda y, i: torch.mean(self.battery.physics.state(y, "stress"), dim=1))
-            self.register_output("stress_min", lambda y, i: torch.min(self.battery.physics.state(y, "stress"), dim=1).values)
-            self.register_output("stress_max", lambda y, i: torch.max(self.battery.physics.state(y, "stress"), dim=1).values)
-            self.register_output("force_from_stress", self._force_from_stress)
+        layout = self.battery.physics.state_layout
+        for name, spec in DERIVED_OUTPUTS.items():
+            if not spec.is_enabled(self.battery):
+                continue
+            if any(state_name not in layout for state_name in spec.requires_state):
+                continue
+            self.register_output(
+                name,
+                lambda y, i_pack, output_spec=spec: output_spec.fn(self.battery, y, i_pack),
+            )
 
     def _cell_current(self, y, i_pack):
         if torch.is_tensor(i_pack):

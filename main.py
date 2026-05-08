@@ -4,6 +4,7 @@ import matplotlib.pyplot as plt
 import time
 import pandas as pd
 from initial_states import get_hardcoded_discharged_state
+from model_registry import enabled_state_equations, evaluate_registered_rhs
 from output_manager import SimulationOutputManager
 from pack_modules import build_balancing_module, build_thermal_module
 from pde_framework import CompositeMesh, ChebyshevRegionOperators, ElectrolytePDEModel, FiniteVolumeOperators, StateLayout
@@ -53,11 +54,15 @@ class BatteryPhysics(torch.nn.Module):
         self.electrolyte_mesh = self._build_electrolyte_mesh(p0)
         self.electrolyte_operators = self._build_electrolyte_operators()
         self.electrolyte_model = ElectrolytePDEModel(self.electrolyte_mesh, self.electrolyte_operators)
-        self.stress_options = config.get('stress_options', {})
-        self.stress_enabled = bool(self.stress_options.get('enabled', True))
-        self.stress_model = ElectrolytePDEModel(self.electrolyte_mesh, self.electrolyte_operators) if self.stress_enabled else None
-        
-        self.sei_enabled = config.get('sei_options', {}).get('enabled', True)
+
+        self.state_equation_specs = enabled_state_equations(self, config)
+        self.state_equation_options = {
+            name: spec.options(config)
+            for name, spec in self.state_equation_specs.items()
+        }
+        self.stress_options = self.state_equation_options.get('stress', {})
+        self.stress_enabled = 'stress' in self.state_equation_specs
+        self.sei_enabled = 'Lsei' in self.state_equation_specs
         self.state_layout = self._build_state_layout(config)
         self.state_size = self.state_layout.total_size
         
@@ -79,22 +84,17 @@ class BatteryPhysics(torch.nn.Module):
 
     def _build_state_layout(self, config):
         layout = StateLayout()
-        layout.register('cs_n', self.Nr_n, initial=29866.0, scale=30000.0)
-        layout.register('cs_p', self.Nr_p, initial=17038.0, scale=30000.0)
-        layout.register(
-            'electrolyte',
-            self.Nel,
-            initial=lambda p, device, dtype: self.eps_vec.to(device=device, dtype=dtype) * p['ce_0'],
-            scale=1000.0,
-        )
-
-        if self.stress_enabled:
+        temperature_spec = None
+        for name, spec in self.state_equation_specs.items():
+            if name == 'temperature':
+                temperature_spec = spec
+                continue
             layout.register(
-                'stress',
-                self.Nel,
-                initial=self.stress_options.get('initial', 0.0),
-                scale=self.stress_options.get('scale', 1e6),
-                nonnegative=False,
+                name,
+                spec.resolved_size(self, config),
+                initial=spec.resolved_initial(self, config),
+                scale=spec.resolved_scale(self, config),
+                nonnegative=spec.nonnegative,
             )
 
         for field in config.get('extra_state_fields', []):
@@ -106,27 +106,26 @@ class BatteryPhysics(torch.nn.Module):
                 nonnegative=field.get('nonnegative', False),
             )
 
-        if self.sei_enabled:
-            layout.register('sei', self.Nsei, initial=0.0, scale=1.0)
-            layout.register('Lsei', 1, initial='Lsei_0', scale=1e-8)
-        layout.register('temperature', 1, initial='T_amb', scale=300.0)
+        if temperature_spec is not None:
+            layout.register(
+                'temperature',
+                temperature_spec.resolved_size(self, config),
+                initial=temperature_spec.resolved_initial(self, config),
+                scale=temperature_spec.resolved_scale(self, config),
+                nonnegative=temperature_spec.nonnegative,
+            )
         return layout
 
     def state(self, y, name):
         return self.state_layout.get(y, name)
 
-    def _evaluate_stress_rhs(self, stress, ce_state, p):
-        diffusivity = torch.ones_like(stress) * float(self.stress_options.get('diffusivity', 1e-12))
-        relaxation = float(self.stress_options.get('relaxation', 1e-4))
-        coupling = float(self.stress_options.get('coupling', 1.0))
-        source = coupling * (ce_state - p['ce_0']) - relaxation * stress
-
+    def evaluate_diffusion_source_rhs(self, state_values, diffusivity, source):
         flux_coefficient = -diffusivity
         if self.discretization_methods['electrolyte'] == 'finite_volume':
             flux_coefficient = lambda ctx, coeff=diffusivity: -ctx.operators.face_coefficients(coeff)
 
-        return self.stress_model.evaluate(
-            stress,
+        return self.electrolyte_model.evaluate(
+            state_values,
             flux_coefficient=flux_coefficient,
             source=source,
         )
@@ -510,8 +509,17 @@ class BatteryPhysics(torch.nn.Module):
         if self.sei_enabled:
             derivatives['sei'] = torch.zeros(self.Nsei, device=self.device, dtype=y_flat.dtype)
             derivatives['Lsei'] = dLsei_dt
-        if self.stress_enabled:
-            derivatives['stress'] = self._evaluate_stress_rhs(self.state(y_flat, 'stress'), ce_state, p)
+        context = {
+            'ce_state': ce_state,
+            'ce_real': ce_real,
+            'y_old': y_old,
+            'dt': dt,
+            'dcs_n': dcs_n_out,
+            'dcs_p': dcs_p_out,
+            'dce': dce_out,
+            'dT_dt': dT_dt,
+        }
+        evaluate_registered_rhs(self, y_flat, I_app, p, context, derivatives)
         return self.state_layout.pack(derivatives, device=self.device, dtype=y_flat.dtype)
 
     def batched_derivatives(self, y_batch, I_batch, y_old_batch=None, dt=None):
@@ -550,6 +558,7 @@ class ImplicitBatterySolver:
                 self.raw_params[k[0]*config['n_parallel'] + k[1]].update(v)
                 
         self.physics = BatteryPhysics(config, discretization, self.raw_params, self.device)
+        self.sei_enabled = self.physics.sei_enabled
         self.Gth = self._build_thermal_connection_matrix().to(self.device)
         self.Cth = torch.tensor([p['rho_Cp']*p['Vol_cell'] for p in self.raw_params], device=self.device).reshape(-1,1)
         self.h_amb = torch.tensor([p['hA'] for p in self.raw_params], device=self.device).reshape(-1,1)
