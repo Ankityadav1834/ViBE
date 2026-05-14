@@ -4,7 +4,9 @@ from controllers import build_controller
 # Configuration for the battery pack
 config = {
     'n_series': 2,      # Number of cells in series
-    'n_parallel': 1,   # Number of cells in parallel
+    'n_parallel': 2,   # Number of cells in parallel
+    'electrolyte_spatial_method': 'finite_volume',  # 'finite_volume', 'finite_difference', or 'chebyshev'
+    'solid_spatial_method': 'chebyshev',            # Particle PDEs currently use spherical Chebyshev operators.
     'stress_options': {
         'enabled': False,      # Set True to add the example stress PDE state.
         'initial': 0.0,        # Initial stress-like field value [Pa]
@@ -36,18 +38,18 @@ controller_config = {
         'target_c_rate': 2.0
     },
     'cycle_cccv': {
-        'cc_current': -20.0,         # Charging current (A)
+        'cc_current': -10.0,         # Charging current (A)
         'cv_voltage': 4.2,          # CV voltage (V)
         'cutoff_current': 1.0,      # Cutoff current for CV (A)
-        'discharge_current': 20.0,  # Discharge current (A)
+        'discharge_current': 10.0,  # Discharge current (A)
         'min_voltage': 2.4,         # Discharge cutoff voltage (V)
         'max_voltage': 4.4,         # Charge cutoff voltage (V)
-        'n_cycles': 4           # Number of cycles
+        'n_cycles': 100          # Number of cycles
     }
 }
 
 solver_method = 'advanced'   # 'basic' or 'advanced'
-pack_current = 5.0
+pack_current = 25.0
 
 # Discretization parameters
 discretization = {
@@ -126,7 +128,7 @@ if use_controller:
     )
 else:
     battery_solver.simulate(
-        t_end=3600.0,
+        t_end=3000.0,
         dt_init=1.0,
         I_pack=pack_current,
         method=solver_method

@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 
@@ -7,11 +7,32 @@ class Expression:
     def __add__(self, other):
         return Add(self, ensure_expression(other))
 
+    def __radd__(self, other):
+        return Add(ensure_expression(other), self)
+
+    def __sub__(self, other):
+        return Subtract(self, ensure_expression(other))
+
+    def __rsub__(self, other):
+        return Subtract(ensure_expression(other), self)
+
     def __mul__(self, other):
         return Multiply(self, ensure_expression(other))
 
     def __rmul__(self, other):
         return Multiply(ensure_expression(other), self)
+
+    def __truediv__(self, other):
+        return Divide(self, ensure_expression(other))
+
+    def __rtruediv__(self, other):
+        return Divide(ensure_expression(other), self)
+
+    def __pow__(self, other):
+        return Power(self, ensure_expression(other))
+
+    def __neg__(self):
+        return Negate(self)
 
 
 @dataclass(frozen=True)
@@ -46,7 +67,18 @@ class SphericalDiv(Expression):
 
 
 @dataclass(frozen=True)
+class Laplacian(Expression):
+    child: Expression
+
+
+@dataclass(frozen=True)
 class Add(Expression):
+    left: Expression
+    right: Expression
+
+
+@dataclass(frozen=True)
+class Subtract(Expression):
     left: Expression
     right: Expression
 
@@ -57,10 +89,129 @@ class Multiply(Expression):
     right: Expression
 
 
+@dataclass(frozen=True)
+class Divide(Expression):
+    left: Expression
+    right: Expression
+
+
+@dataclass(frozen=True)
+class Power(Expression):
+    left: Expression
+    right: Expression
+
+
+@dataclass(frozen=True)
+class Negate(Expression):
+    child: Expression
+
+
 def ensure_expression(value):
     if isinstance(value, Expression):
         return value
     return Constant(float(value))
+
+
+def diffusion_source_expression(variable_name):
+    """
+    Conservative flux-source PDE:
+
+        d(state)/dt = -Div(flux_coefficient * Grad(state)) + source
+
+    A normal diffusion equation uses flux_coefficient = -D.
+    """
+    variable = Variable(variable_name)
+    return -Div(Parameter("flux_coefficient") * Grad(variable)) + Parameter("source")
+
+
+def conservative_flux_expression(flux_name="flux", source_name="source"):
+    return -Div(Parameter(flux_name)) + Parameter(source_name)
+
+
+def spherical_diffusion_expression(variable_name):
+    return SphericalDiv(
+        Parameter("diffusivity") * Grad(Variable(variable_name)),
+        Parameter("radius"),
+    )
+
+
+Field = Variable
+Param = Parameter
+
+
+def grad(expr):
+    return Grad(ensure_expression(expr))
+
+
+def div(expr):
+    return Div(ensure_expression(expr))
+
+
+def laplacian(expr):
+    return Laplacian(ensure_expression(expr))
+
+
+def spherical_div(expr, radius):
+    return SphericalDiv(ensure_expression(expr), ensure_expression(radius))
+
+
+@dataclass(frozen=True)
+class BoundaryCondition:
+    """
+    Boundary condition metadata used by operator PDE models.
+
+    kind:
+        "neumann" means the boundary flux/normal-gradient residual is enforced.
+        "dirichlet" means the state value itself is constrained.
+        "residual" means value is already an algebraic residual.
+    value:
+        scalar/tensor/callable. Callable values receive a DiscretizationContext
+        for flux-source PDEs and a small dict for spherical particle PDEs.
+    """
+
+    kind: str
+    value: object = 0.0
+
+
+@dataclass(frozen=True)
+class DomainSpec:
+    name: str
+    regions: tuple = ()
+    method: object = None
+    notes: str = ""
+
+
+@dataclass(frozen=True)
+class OperatorEquationSpec:
+    """
+    PyBaMM-inspired symbolic PDE declaration.
+
+    State registry entries point at one of these specs. The BatteryPhysics layer
+    supplies nonlinear coefficients/sources at runtime; this spec defines the
+    operator form, region/domain, evaluator, and default boundary conditions.
+    """
+
+    state_name: str
+    variable_name: str
+    domain: str
+    rhs: Expression
+    evaluator: str = "general"
+    method: object = None
+    values: object = None
+    time_values: object = None
+    variables: dict = field(default_factory=dict)
+    parameters: dict = field(default_factory=dict)
+    flux: Expression = None
+    source: Expression = None
+    boundary_conditions: dict = field(default_factory=dict)
+    notes: str = ""
+
+
+@dataclass
+class OperatorEvaluation:
+    rhs: torch.Tensor
+    flux: torch.Tensor = None
+    context: object = None
 
 
 @dataclass(frozen=True)
@@ -464,14 +615,29 @@ def discretize(expr, context):
     if isinstance(expr, Add):
         return discretize(expr.left, context) + discretize(expr.right, context)
 
+    if isinstance(expr, Subtract):
+        return discretize(expr.left, context) - discretize(expr.right, context)
+
     if isinstance(expr, Multiply):
         return discretize(expr.left, context) * discretize(expr.right, context)
+
+    if isinstance(expr, Divide):
+        return discretize(expr.left, context) / discretize(expr.right, context)
+
+    if isinstance(expr, Power):
+        return discretize(expr.left, context) ** discretize(expr.right, context)
+
+    if isinstance(expr, Negate):
+        return -discretize(expr.child, context)
 
     if isinstance(expr, Grad):
         return context.operators.gradient(discretize(expr.child, context))
 
     if isinstance(expr, Div):
         return context.operators.divergence(discretize(expr.child, context))
+
+    if isinstance(expr, Laplacian):
+        return context.operators.divergence(context.operators.gradient(discretize(expr.child, context)))
 
     if isinstance(expr, SphericalDiv):
         r = discretize(expr.radius, context)
@@ -493,85 +659,678 @@ def discretize(expr, context):
     raise TypeError(f"Unsupported expression type: {type(expr)!r}")
 
 
-class ElectrolytePDEModel:
+def _as_boundary_condition(value):
+    if isinstance(value, BoundaryCondition):
+        return value
+    if isinstance(value, dict):
+        return BoundaryCondition(
+            kind=value.get("kind", value.get("type", "neumann")),
+            value=value.get("value", 0.0),
+        )
+    return BoundaryCondition(kind="neumann", value=value)
+
+
+def _resolve_context_value(value, context):
+    return value(context) if callable(value) else value
+
+
+class OperatorPDEPipeline:
     """
-    Symbolic electrolyte diffusion equation plus generic boundary-condition embedding.
-    This replaces only the discretization layer, not the Newton solver or state layout.
+    Registry of discretized PDE models.
+
+    BatteryPhysics builds one of these once, then derivative evaluation asks the
+    pipeline for each state's RHS. Adding a PDE becomes:
+
+    1. Add an OperatorEquationSpec to the state registry.
+    2. Provide runtime coefficients/sources in BatteryPhysics.
+    3. Let the pipeline select the domain operators and boundary handling.
     """
 
-    def __init__(self, mesh, operators):
+    def __init__(self):
+        self.models = {}
+
+    def register(self, state_name, model):
+        if state_name in self.models:
+            raise ValueError(f"Operator PDE {state_name!r} is already registered.")
+        self.models[state_name] = model
+
+    def __contains__(self, state_name):
+        return state_name in self.models
+
+    def model(self, state_name):
+        return self.models[state_name]
+
+    def evaluate_state(self, state_name, **kwargs):
+        return self.models[state_name].evaluate(**kwargs)
+
+
+class GeneralOperatorPDEModel:
+    """
+    Generic expression evaluator.
+
+    This is the most open-ended path: the RHS is any expression built from the
+    supported expression nodes and runtime parameters. Use this for local ODEs,
+    reaction terms, advection-like terms, or custom operator expressions that do
+    not need finite-volume boundary-flux injection.
+    """
+
+    def __init__(self, mesh, operators, spec):
         self.mesh = mesh
         self.operators = operators
-        self.ce = Variable("ce")
-        self.equation = Add(
-            Multiply(Constant(-1.0), Div(Multiply(Parameter("flux_coefficient"), Grad(self.ce)))),
-            Parameter("source")
-        )
+        self.spec = spec
+        self.variable_name = spec.variable_name
+        self.equation = spec.rhs
 
-    def evaluate(self, ce, flux_coefficient, source, boundary_data=None):
-        context = DiscretizationContext(
+    def _merge_boundary_conditions(self, boundary_conditions):
+        merged = dict(self.spec.boundary_conditions)
+        if boundary_conditions:
+            merged.update(boundary_conditions)
+        return merged
+
+    def _build_context(self, values, parameters, variables=None, boundary_conditions=None):
+        variable_values = dict(variables or {})
+        variable_values.setdefault(self.variable_name, values)
+        return DiscretizationContext(
             mesh=self.mesh,
             operators=self.operators,
-            variables={"ce": ce},
-            parameters={"flux_coefficient": flux_coefficient, "source": source},
-            boundary_conditions=boundary_data or {}
+            variables=variable_values,
+            parameters=dict(parameters or {}),
+            boundary_conditions=self._merge_boundary_conditions(boundary_conditions),
         )
-        return discretize(self.equation, context)
+
+    def _evaluate_raw(self, values, context):
+        rhs = discretize(self.equation, context)
+        flux = discretize(self.spec.flux, context) if self.spec.flux is not None else None
+        return OperatorEvaluation(rhs=rhs, flux=flux, context=context)
+
+    def evaluate(
+        self,
+        values,
+        time_values=None,
+        parameters=None,
+        variables=None,
+        boundary_conditions=None,
+        old_values=None,
+        dt=None,
+        return_details=False,
+    ):
+        if time_values is None:
+            time_values = values
+
+        context = self._build_context(values, parameters, variables, boundary_conditions)
+        evaluation = self._evaluate_raw(values, context)
+        rhs = evaluation.rhs
+
+        if old_values is not None and dt is not None and evaluation.flux is not None:
+            if isinstance(self.operators, ChebyshevRegionOperators):
+                rhs = self.apply_chebyshev_boundary_constraints(
+                    values=values,
+                    time_values=time_values,
+                    rhs=rhs,
+                    flux=evaluation.flux,
+                    old_values=old_values,
+                    dt=dt,
+                    boundary_conditions=context.boundary_conditions,
+                )
+            elif isinstance(self.operators, FiniteDifferenceOperators):
+                rhs = self.apply_endpoint_boundary_constraints(
+                    values=values,
+                    time_values=time_values,
+                    rhs=rhs,
+                    flux=evaluation.flux,
+                    old_values=old_values,
+                    dt=dt,
+                    boundary_conditions=context.boundary_conditions,
+                    context=context,
+                )
+
+        if return_details:
+            return OperatorEvaluation(rhs=rhs, flux=evaluation.flux, context=context)
+        return rhs
+
+    def apply_endpoint_boundary_constraints(
+        self,
+        values,
+        time_values,
+        rhs,
+        flux,
+        old_values,
+        dt,
+        boundary_conditions,
+        context,
+    ):
+        constrained = rhs.clone()
+        for location, index in (("left", 0), ("right", -1)):
+            if location not in boundary_conditions:
+                continue
+            bc = _as_boundary_condition(boundary_conditions[location])
+            target = _resolve_context_value(bc.value, context)
+            if bc.kind == "dirichlet":
+                residual = values[index] - target
+            elif bc.kind == "residual":
+                residual = target
+            else:
+                residual = flux[index] - target
+            constrained[index] = (time_values[index] - old_values[index]) / dt - residual / dt
+        return constrained
 
     def apply_chebyshev_boundary_constraints(
         self,
-        ce,
-        dce,
+        values,
+        time_values,
+        rhs,
         flux,
-        ce_old,
+        old_values,
         dt,
         boundary_conditions,
     ):
         if not isinstance(self.operators, ChebyshevRegionOperators):
-            return dce
+            return rhs
 
-        ce_regions = self.operators.split_by_region(ce)
-        dce_regions = self.operators.split_by_region(dce)
+        values_regions = self.operators.split_by_region(values)
+        time_regions = self.operators.split_by_region(time_values)
+        rhs_regions = {
+            name: chunk.clone()
+            for name, chunk in self.operators.split_by_region(rhs).items()
+        }
         flux_regions = self.operators.split_by_region(flux)
-        ce_old_regions = self.operators.split_by_region(ce_old)
+        old_regions = self.operators.split_by_region(old_values)
 
         names = self.mesh.region_names
-
-        left_bc = boundary_conditions.get("left", {"type": "neumann", "value": 0.0})
-        right_bc = boundary_conditions.get("right", {"type": "neumann", "value": 0.0})
+        bc_context = DiscretizationContext(
+            self.mesh,
+            self.operators,
+            {self.variable_name: values},
+            {},
+            boundary_conditions=boundary_conditions,
+        )
 
         first_name = names[0]
-        if left_bc["type"] == "neumann":
-            dce_regions[first_name][0] = (
-                (ce_regions[first_name][0] - ce_old_regions[first_name][0]) / dt
-                - (flux_regions[first_name][0] - left_bc["value"]) / dt
-            )
-        elif left_bc["type"] == "dirichlet":
-            dce_regions[first_name][0] = (
-                (ce_regions[first_name][0] - ce_old_regions[first_name][0]) / dt
-                - (ce_regions[first_name][0] - left_bc["value"]) / dt
-            )
+        left_bc = _as_boundary_condition(
+            boundary_conditions.get("left", BoundaryCondition("neumann", 0.0))
+        )
+        left_value = _resolve_context_value(left_bc.value, bc_context)
+        if left_bc.kind == "dirichlet":
+            left_residual = values_regions[first_name][0] - left_value
+        elif left_bc.kind == "residual":
+            left_residual = left_value
+        else:
+            left_residual = flux_regions[first_name][0] - left_value
+        rhs_regions[first_name][0] = (
+            (time_regions[first_name][0] - old_regions[first_name][0]) / dt
+            - left_residual / dt
+        )
 
         last_name = names[-1]
-        if right_bc["type"] == "neumann":
-            dce_regions[last_name][-1] = (
-                (ce_regions[last_name][-1] - ce_old_regions[last_name][-1]) / dt
-                - (flux_regions[last_name][-1] - right_bc["value"]) / dt
-            )
-        elif right_bc["type"] == "dirichlet":
-            dce_regions[last_name][-1] = (
-                (ce_regions[last_name][-1] - ce_old_regions[last_name][-1]) / dt
-                - (ce_regions[last_name][-1] - right_bc["value"]) / dt
-            )
+        right_bc = _as_boundary_condition(
+            boundary_conditions.get("right", BoundaryCondition("neumann", 0.0))
+        )
+        right_value = _resolve_context_value(right_bc.value, bc_context)
+        if right_bc.kind == "dirichlet":
+            right_residual = values_regions[last_name][-1] - right_value
+        elif right_bc.kind == "residual":
+            right_residual = right_value
+        else:
+            right_residual = flux_regions[last_name][-1] - right_value
+        rhs_regions[last_name][-1] = (
+            (time_regions[last_name][-1] - old_regions[last_name][-1]) / dt
+            - right_residual / dt
+        )
 
         for left_name, right_name in zip(names[:-1], names[1:]):
-            dce_regions[left_name][-1] = (
-                (ce_regions[left_name][-1] - ce_old_regions[left_name][-1]) / dt
-                - (ce_regions[left_name][-1] - ce_regions[right_name][0]) / dt
+            rhs_regions[left_name][-1] = (
+                (time_regions[left_name][-1] - old_regions[left_name][-1]) / dt
+                - (values_regions[left_name][-1] - values_regions[right_name][0]) / dt
             )
-            dce_regions[right_name][0] = (
-                (ce_regions[right_name][0] - ce_old_regions[right_name][0]) / dt
+            rhs_regions[right_name][0] = (
+                (time_regions[right_name][0] - old_regions[right_name][0]) / dt
                 - (flux_regions[left_name][-1] - flux_regions[right_name][0]) / dt
             )
 
-        return self.operators.concatenate_by_region(dce_regions)
+        return self.operators.concatenate_by_region(rhs_regions)
+
+
+class ConservativeFluxPDEModel(GeneralOperatorPDEModel):
+    """
+    Conservative 1D PDE evaluator:
+
+        du/dt = -Div(flux) + source
+
+    The flux expression can represent diffusion, migration, advection, or any
+    combination that can be discretized on the selected 1D operators.
+    """
+
+    def __init__(self, mesh, operators, spec):
+        super().__init__(mesh, operators, spec)
+        if spec.flux is None:
+            raise ValueError(f"Conservative PDE {spec.state_name!r} requires spec.flux.")
+
+    def _with_finite_volume_boundary_flux(self, flux, context):
+        if not isinstance(self.operators, FiniteVolumeOperators):
+            return flux
+
+        adjusted = flux.clone()
+        for location, index in (("left", 0), ("right", -1)):
+            if location not in context.boundary_conditions:
+                continue
+            bc = _as_boundary_condition(context.boundary_conditions[location])
+            if bc.kind != "neumann":
+                continue
+            adjusted[index] = _resolve_context_value(bc.value, context)
+        return adjusted
+
+    def _evaluate_raw(self, values, context):
+        flux = discretize(self.spec.flux, context)
+        flux = self._with_finite_volume_boundary_flux(flux, context)
+        source_expr = self.spec.source or Parameter("source")
+        source = discretize(source_expr, context)
+        rhs = -self.operators.divergence(flux) + source
+        return OperatorEvaluation(rhs=rhs, flux=flux, context=context)
+
+
+class DiffusionSourcePDEModel(ConservativeFluxPDEModel):
+    """
+    Generic conservative PDE model:
+
+        du/dt = -Div(flux_coefficient * Grad(u)) + source
+
+    For diffusion, pass flux_coefficient = -D. The class supports the existing
+    finite-volume, finite-difference, and region-wise Chebyshev operators.
+    """
+
+    def __init__(self, mesh, operators, spec=None, variable_name="state"):
+        self.mesh = mesh
+        self.operators = operators
+        if spec is None:
+            spec = OperatorEquationSpec(
+                state_name=variable_name,
+                variable_name=variable_name,
+                domain="through_cell",
+                rhs=diffusion_source_expression(variable_name),
+                evaluator="diffusion_source",
+                flux=Parameter("flux_coefficient") * Grad(Variable(variable_name)),
+                source=Parameter("source"),
+            )
+        self.spec = spec
+        self.variable_name = spec.variable_name
+        self.equation = spec.rhs
+
+    def _merge_boundary_conditions(self, boundary_conditions):
+        merged = dict(self.spec.boundary_conditions)
+        if boundary_conditions:
+            merged.update(boundary_conditions)
+        return merged
+
+    def _build_context(self, values, parameters, variables=None, boundary_conditions=None):
+        variable_values = dict(variables or {})
+        variable_values.setdefault(self.variable_name, values)
+        return DiscretizationContext(
+            mesh=self.mesh,
+            operators=self.operators,
+            variables=variable_values,
+            parameters=dict(parameters or {}),
+            boundary_conditions=self._merge_boundary_conditions(boundary_conditions),
+        )
+
+    def _flux(self, values, context):
+        coefficient = _resolve_context_value(context.parameters["flux_coefficient"], context)
+        return coefficient * self.operators.gradient(values)
+
+    def _source(self, context):
+        return _resolve_context_value(context.parameters["source"], context)
+
+    def _with_finite_volume_boundary_flux(self, flux, context):
+        if not isinstance(self.operators, FiniteVolumeOperators):
+            return flux
+
+        adjusted = flux.clone()
+        for location, index in (("left", 0), ("right", -1)):
+            if location not in context.boundary_conditions:
+                continue
+            bc = _as_boundary_condition(context.boundary_conditions[location])
+            if bc.kind != "neumann":
+                continue
+            adjusted[index] = _resolve_context_value(bc.value, context)
+        return adjusted
+
+    def _evaluate_raw(self, values, context):
+        flux = self._with_finite_volume_boundary_flux(self._flux(values, context), context)
+        if isinstance(self.operators, FiniteVolumeOperators):
+            rhs = -self.operators.divergence(flux) + self._source(context)
+        else:
+            rhs = discretize(self.equation, context)
+        return OperatorEvaluation(rhs=rhs, flux=flux, context=context)
+
+    def evaluate(
+        self,
+        values=None,
+        time_values=None,
+        parameters=None,
+        variables=None,
+        boundary_conditions=None,
+        old_values=None,
+        dt=None,
+        return_details=False,
+        **legacy_kwargs,
+    ):
+        if values is None:
+            values = legacy_kwargs.pop(self.variable_name, None)
+        if values is None and "ce" in legacy_kwargs:
+            values = legacy_kwargs.pop("ce")
+        if parameters is None:
+            parameters = {}
+        parameters = dict(parameters)
+        if "flux_coefficient" in legacy_kwargs:
+            parameters["flux_coefficient"] = legacy_kwargs.pop("flux_coefficient")
+        if "source" in legacy_kwargs:
+            parameters["source"] = legacy_kwargs.pop("source")
+        if boundary_conditions is None:
+            boundary_conditions = legacy_kwargs.pop("boundary_data", None)
+        if time_values is None:
+            time_values = values
+
+        context = self._build_context(values, parameters, variables, boundary_conditions)
+        evaluation = self._evaluate_raw(values, context)
+        rhs = evaluation.rhs
+
+        if old_values is not None and dt is not None:
+            if isinstance(self.operators, ChebyshevRegionOperators):
+                rhs = self.apply_chebyshev_boundary_constraints(
+                    values=values,
+                    time_values=time_values,
+                    rhs=rhs,
+                    flux=evaluation.flux,
+                    old_values=old_values,
+                    dt=dt,
+                    boundary_conditions=context.boundary_conditions,
+                )
+            elif isinstance(self.operators, FiniteDifferenceOperators):
+                rhs = self.apply_endpoint_boundary_constraints(
+                    values=values,
+                    time_values=time_values,
+                    rhs=rhs,
+                    flux=evaluation.flux,
+                    old_values=old_values,
+                    dt=dt,
+                    boundary_conditions=context.boundary_conditions,
+                    context=context,
+                )
+
+        if return_details:
+            return OperatorEvaluation(rhs=rhs, flux=evaluation.flux, context=context)
+        return rhs
+
+    def apply_endpoint_boundary_constraints(
+        self,
+        values,
+        time_values,
+        rhs,
+        flux,
+        old_values,
+        dt,
+        boundary_conditions,
+        context,
+    ):
+        constrained = rhs.clone()
+        for location, index in (("left", 0), ("right", -1)):
+            if location not in boundary_conditions:
+                continue
+            bc = _as_boundary_condition(boundary_conditions[location])
+            target = _resolve_context_value(bc.value, context)
+            if bc.kind == "dirichlet":
+                residual = values[index] - target
+            elif bc.kind == "residual":
+                residual = target
+            else:
+                residual = flux[index] - target
+            constrained[index] = (time_values[index] - old_values[index]) / dt - residual / dt
+        return constrained
+
+    def apply_chebyshev_boundary_constraints(
+        self,
+        values,
+        time_values,
+        rhs,
+        flux,
+        old_values,
+        dt,
+        boundary_conditions,
+    ):
+        if not isinstance(self.operators, ChebyshevRegionOperators):
+            return rhs
+
+        values_regions = self.operators.split_by_region(values)
+        time_regions = self.operators.split_by_region(time_values)
+        rhs_regions = {
+            name: chunk.clone()
+            for name, chunk in self.operators.split_by_region(rhs).items()
+        }
+        flux_regions = self.operators.split_by_region(flux)
+        old_regions = self.operators.split_by_region(old_values)
+
+        names = self.mesh.region_names
+
+        first_name = names[0]
+        left_bc = _as_boundary_condition(
+            boundary_conditions.get("left", BoundaryCondition("neumann", 0.0))
+        )
+        left_value = _resolve_context_value(left_bc.value, DiscretizationContext(
+            self.mesh,
+            self.operators,
+            {self.variable_name: values},
+            {},
+            boundary_conditions=boundary_conditions,
+        ))
+        if left_bc.kind == "dirichlet":
+            left_residual = values_regions[first_name][0] - left_value
+        elif left_bc.kind == "residual":
+            left_residual = left_value
+        else:
+            left_residual = flux_regions[first_name][0] - left_value
+        rhs_regions[first_name][0] = (
+            (time_regions[first_name][0] - old_regions[first_name][0]) / dt
+            - left_residual / dt
+        )
+
+        last_name = names[-1]
+        right_bc = _as_boundary_condition(
+            boundary_conditions.get("right", BoundaryCondition("neumann", 0.0))
+        )
+        right_value = _resolve_context_value(right_bc.value, DiscretizationContext(
+            self.mesh,
+            self.operators,
+            {self.variable_name: values},
+            {},
+            boundary_conditions=boundary_conditions,
+        ))
+        if right_bc.kind == "dirichlet":
+            right_residual = values_regions[last_name][-1] - right_value
+        elif right_bc.kind == "residual":
+            right_residual = right_value
+        else:
+            right_residual = flux_regions[last_name][-1] - right_value
+        rhs_regions[last_name][-1] = (
+            (time_regions[last_name][-1] - old_regions[last_name][-1]) / dt
+            - right_residual / dt
+        )
+
+        for left_name, right_name in zip(names[:-1], names[1:]):
+            rhs_regions[left_name][-1] = (
+                (time_regions[left_name][-1] - old_regions[left_name][-1]) / dt
+                - (values_regions[left_name][-1] - values_regions[right_name][0]) / dt
+            )
+            rhs_regions[right_name][0] = (
+                (time_regions[right_name][0] - old_regions[right_name][0]) / dt
+                - (flux_regions[left_name][-1] - flux_regions[right_name][0]) / dt
+            )
+
+        return self.operators.concatenate_by_region(rhs_regions)
+
+
+class ElectrolytePDEModel(DiffusionSourcePDEModel):
+    """
+    Backward-compatible name for the through-cell flux-source PDE model.
+    """
+
+    def __init__(self, mesh, operators):
+        spec = OperatorEquationSpec(
+            state_name="electrolyte",
+            variable_name="ce",
+            domain="through_cell",
+            rhs=diffusion_source_expression("ce"),
+            evaluator="diffusion_source",
+            flux=Parameter("flux_coefficient") * Grad(Variable("ce")),
+            source=Parameter("source"),
+        )
+        super().__init__(mesh, operators, spec=spec)
+
+    def apply_chebyshev_boundary_constraints(
+        self,
+        ce=None,
+        dce=None,
+        flux=None,
+        ce_old=None,
+        dt=None,
+        boundary_conditions=None,
+        **kwargs,
+    ):
+        values = kwargs.pop("values", ce)
+        time_values = kwargs.pop("time_values", values)
+        rhs = kwargs.pop("rhs", dce)
+        old_values = kwargs.pop("old_values", ce_old)
+        return super().apply_chebyshev_boundary_constraints(
+            values=values,
+            time_values=time_values,
+            rhs=rhs,
+            flux=flux,
+            old_values=old_values,
+            dt=dt,
+            boundary_conditions=boundary_conditions or {},
+        )
+
+
+class SphericalParticlePDEModel:
+    """
+    Spherical diffusion on a Chebyshev particle-radius domain:
+
+        dc/dt = D * (d2c/dr2 + 2/r * dc/dr)
+
+    Boundary conditions are embedded as algebraic residuals during implicit
+    Newton steps in the same DAE style used by the original implementation.
+    """
+
+    def __init__(self, radius_nodes, first_matrix, second_matrix, spec=None, variable_name="c"):
+        self.radius_nodes = radius_nodes
+        self.first_matrix = first_matrix
+        self.second_matrix = second_matrix
+        if spec is None:
+            spec = OperatorEquationSpec(
+                state_name=variable_name,
+                variable_name=variable_name,
+                domain="particle_radius",
+                rhs=spherical_diffusion_expression(variable_name),
+                evaluator="spherical_particle",
+            )
+        self.spec = spec
+        self.variable_name = spec.variable_name
+
+    def _merge_boundary_conditions(self, boundary_conditions):
+        merged = dict(self.spec.boundary_conditions)
+        if boundary_conditions:
+            merged.update(boundary_conditions)
+        return merged
+
+    def _physical_operators(self, radius):
+        first = self.first_matrix / radius
+        second = self.second_matrix / (radius ** 2)
+        r = self.radius_nodes * radius
+        return r, first, second
+
+    def gradient(self, values, radius):
+        _r, first, _second = self._physical_operators(radius)
+        return torch.mv(first, values)
+
+    def evaluate(
+        self,
+        values,
+        time_values=None,
+        parameters=None,
+        variables=None,
+        boundary_conditions=None,
+        old_values=None,
+        dt=None,
+        return_details=False,
+    ):
+        parameters = dict(parameters or {})
+        diffusivity = parameters["diffusivity"]
+        radius = parameters.get("particle_radius", parameters.get("radius"))
+        if radius is None:
+            raise ValueError("Spherical particle PDE requires 'particle_radius' or 'radius'.")
+
+        r, first, second = self._physical_operators(radius)
+        r_safe = r.clone()
+        r_safe[0] = 1.0
+
+        second_term = torch.mv(second, values)
+        first_term = (2.0 / r_safe) * torch.mv(first, values)
+        rhs = diffusivity * (second_term + first_term)
+        rhs[0] = 3.0 * diffusivity * second_term[0]
+
+        boundary_conditions = self._merge_boundary_conditions(boundary_conditions)
+        if old_values is not None and dt is not None:
+            rhs = self.apply_boundary_constraints(
+                values=values,
+                rhs=rhs,
+                old_values=old_values,
+                dt=dt,
+                diffusivity=diffusivity,
+                radius=radius,
+                boundary_conditions=boundary_conditions,
+            )
+
+        if return_details:
+            return OperatorEvaluation(
+                rhs=rhs,
+                flux=-diffusivity * self.gradient(values, radius),
+                context={
+                    "values": values,
+                    "parameters": parameters,
+                    "boundary_conditions": boundary_conditions,
+                },
+            )
+        return rhs
+
+    def _boundary_residual(self, location, index, bc, values, diffusivity, radius):
+        ctx = {
+            "location": location,
+            "index": index,
+            "values": values,
+            "diffusivity": diffusivity,
+            "radius": radius,
+            "gradient": self.gradient(values, radius),
+        }
+        target = bc.value(ctx) if callable(bc.value) else bc.value
+        if bc.kind == "dirichlet":
+            return values[index] - target
+        if bc.kind == "residual":
+            return target
+        return ctx["gradient"][index] - target
+
+    def apply_boundary_constraints(
+        self,
+        values,
+        rhs,
+        old_values,
+        dt,
+        diffusivity,
+        radius,
+        boundary_conditions,
+    ):
+        constrained = rhs.clone()
+        for location, index in (("center", 0), ("left", 0), ("surface", -1), ("right", -1)):
+            if location not in boundary_conditions:
+                continue
+            bc = _as_boundary_condition(boundary_conditions[location])
+            residual = self._boundary_residual(location, index, bc, values, diffusivity, radius)
+            constrained[index] = (values[index] - old_values[index]) / dt - residual / dt
+        return constrained

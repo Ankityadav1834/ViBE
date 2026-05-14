@@ -1,0 +1,1 @@
+"""Assembly pipeline: symbolic → discrete."""

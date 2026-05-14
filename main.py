@@ -4,10 +4,21 @@ import matplotlib.pyplot as plt
 import time
 import pandas as pd
 from initial_states import get_hardcoded_discharged_state
-from model_registry import enabled_state_equations, evaluate_registered_rhs
+from states import enabled_state_equations, evaluate_registered_rhs
 from output_manager import SimulationOutputManager
 from pack_modules import build_balancing_module, build_thermal_module
-from pde_framework import CompositeMesh, ChebyshevRegionOperators, ElectrolytePDEModel, FiniteVolumeOperators, StateLayout
+from pde_framework import (
+    ChebyshevRegionOperators,
+    CompositeMesh,
+    ConservativeFluxPDEModel,
+    DiffusionSourcePDEModel,
+    ElectrolytePDEModel,
+    FiniteVolumeOperators,
+    GeneralOperatorPDEModel,
+    OperatorPDEPipeline,
+    SphericalParticlePDEModel,
+    StateLayout,
+)
 from solver import BasicSolver, AdvancedSolver, ControlledSolver
 
 # Use Double Precision for Battery Physics Stability
@@ -53,13 +64,18 @@ class BatteryPhysics(torch.nn.Module):
         }
         self.electrolyte_mesh = self._build_electrolyte_mesh(p0)
         self.electrolyte_operators = self._build_electrolyte_operators()
-        self.electrolyte_model = ElectrolytePDEModel(self.electrolyte_mesh, self.electrolyte_operators)
 
         self.state_equation_specs = enabled_state_equations(self, config)
         self.state_equation_options = {
             name: spec.options(config)
             for name, spec in self.state_equation_specs.items()
         }
+        self.operator_pipeline = self._build_operator_pipeline()
+        self.electrolyte_model = (
+            self.operator_pipeline.model('electrolyte')
+            if 'electrolyte' in self.operator_pipeline
+            else ElectrolytePDEModel(self.electrolyte_mesh, self.electrolyte_operators)
+        )
         self.stress_options = self.state_equation_options.get('stress', {})
         self.stress_enabled = 'stress' in self.state_equation_specs
         self.sei_enabled = 'Lsei' in self.state_equation_specs
@@ -116,19 +132,189 @@ class BatteryPhysics(torch.nn.Module):
             )
         return layout
 
+    def _build_operator_pipeline(self):
+        pipeline = OperatorPDEPipeline()
+        for name, state_spec in self.state_equation_specs.items():
+            operator_spec = state_spec.operator
+            if operator_spec is None:
+                continue
+
+            if operator_spec.evaluator in ('general', 'operator'):
+                if operator_spec.domain != 'through_cell':
+                    raise ValueError(
+                        f"General operator PDE {name!r} uses unsupported domain "
+                        f"{operator_spec.domain!r}. Supported domain: 'through_cell'."
+                    )
+                model = GeneralOperatorPDEModel(
+                    self.electrolyte_mesh,
+                    self.electrolyte_operators,
+                    spec=operator_spec,
+                )
+            elif operator_spec.evaluator in ('conservative', 'flux_source'):
+                if operator_spec.domain != 'through_cell':
+                    raise ValueError(
+                        f"Conservative PDE {name!r} uses unsupported domain "
+                        f"{operator_spec.domain!r}. Supported domain: 'through_cell'."
+                    )
+                model = ConservativeFluxPDEModel(
+                    self.electrolyte_mesh,
+                    self.electrolyte_operators,
+                    spec=operator_spec,
+                )
+            elif operator_spec.evaluator == 'diffusion_source':
+                if operator_spec.domain != 'through_cell':
+                    raise ValueError(
+                        f"Diffusion-source PDE {name!r} uses unsupported domain "
+                        f"{operator_spec.domain!r}. Supported domain: 'through_cell'."
+                    )
+                model = DiffusionSourcePDEModel(
+                    self.electrolyte_mesh,
+                    self.electrolyte_operators,
+                    spec=operator_spec,
+                )
+            elif operator_spec.evaluator == 'spherical_particle':
+                if operator_spec.domain == 'negative_particle':
+                    model = SphericalParticlePDEModel(
+                        self.r_n_ref,
+                        self.Dr_n_ref,
+                        self.D2r_n_ref,
+                        spec=operator_spec,
+                    )
+                elif operator_spec.domain == 'positive_particle':
+                    model = SphericalParticlePDEModel(
+                        self.r_p_ref,
+                        self.Dr_p_ref,
+                        self.D2r_p_ref,
+                        spec=operator_spec,
+                    )
+                else:
+                    raise ValueError(
+                        f"Spherical particle PDE {name!r} uses unsupported domain "
+                        f"{operator_spec.domain!r}. Supported domains: "
+                        "'negative_particle', 'positive_particle'."
+                    )
+            else:
+                raise ValueError(
+                    f"Operator PDE {name!r} has unsupported evaluator "
+                    f"{operator_spec.evaluator!r}."
+                )
+
+            pipeline.register(name, model)
+        return pipeline
+
     def state(self, y, name):
         return self.state_layout.get(y, name)
 
-    def evaluate_diffusion_source_rhs(self, state_values, diffusivity, source):
-        flux_coefficient = -diffusivity
+    def through_cell_flux_coefficient(self, diffusivity):
+        coefficient = -diffusivity
         if self.discretization_methods['electrolyte'] == 'finite_volume':
-            flux_coefficient = lambda ctx, coeff=diffusivity: -ctx.operators.face_coefficients(coeff)
+            coefficient = lambda ctx, coeff=diffusivity: -ctx.operators.face_coefficients(coeff)
+        return coefficient
 
+    def evaluate_diffusion_source_rhs(self, state_values, diffusivity, source):
         return self.electrolyte_model.evaluate(
-            state_values,
-            flux_coefficient=flux_coefficient,
-            source=source,
+            values=state_values,
+            parameters={
+                'flux_coefficient': self.through_cell_flux_coefficient(diffusivity),
+                'source': source,
+            },
         )
+
+    def _resolve_operator_item(self, resolver, y_flat, i_app, p, context, default=None):
+        if resolver is None:
+            return default
+        if callable(resolver):
+            return resolver(self, y_flat, i_app, p, context)
+        if isinstance(resolver, str):
+            if resolver in context:
+                return context[resolver]
+            if resolver in p:
+                return p[resolver]
+            if resolver in self.state_layout:
+                return self.state(y_flat, resolver)
+        return resolver
+
+    def _resolve_operator_map(self, resolvers, y_flat, i_app, p, context):
+        return {
+            key: self._resolve_operator_item(value, y_flat, i_app, p, context)
+            for key, value in resolvers.items()
+        }
+
+    def _resolve_operator_boundary_conditions(self, boundary_conditions, y_flat, i_app, p, context):
+        resolved = {}
+        for location, condition in boundary_conditions.items():
+            if isinstance(condition, dict):
+                kind = condition.get('kind', condition.get('type', 'neumann'))
+                value = condition.get('value', 0.0)
+            else:
+                kind = getattr(condition, 'kind', 'neumann')
+                value = getattr(condition, 'value', condition)
+            value = self._resolve_operator_item(value, y_flat, i_app, p, context, default=value)
+            resolved[location] = {'type': kind, 'value': value}
+        return resolved
+
+    def evaluate_operator_state(self, name, y_flat, i_app, p, context, derivatives=None, return_details=False):
+        state_spec = self.state_equation_specs[name]
+        operator_spec = state_spec.operator
+        if operator_spec is None:
+            raise ValueError(f"State {name!r} does not define an operator equation.")
+        if name not in self.operator_pipeline:
+            raise ValueError(f"State {name!r} is not registered in the operator pipeline.")
+
+        default_values = self.state(y_flat, name)
+        values = self._resolve_operator_item(
+            operator_spec.values,
+            y_flat,
+            i_app,
+            p,
+            context,
+            default=default_values,
+        )
+        time_values = self._resolve_operator_item(
+            operator_spec.time_values,
+            y_flat,
+            i_app,
+            p,
+            context,
+            default=default_values,
+        )
+        parameters = self._resolve_operator_map(operator_spec.parameters, y_flat, i_app, p, context)
+        variables = self._resolve_operator_map(operator_spec.variables, y_flat, i_app, p, context)
+        boundary_conditions = self._resolve_operator_boundary_conditions(
+            operator_spec.boundary_conditions,
+            y_flat,
+            i_app,
+            p,
+            context,
+        )
+
+        y_old = context.get('y_old')
+        old_values = self.state(y_old, name) if y_old is not None else None
+        evaluation = self.operator_pipeline.evaluate_state(
+            name,
+            values=values,
+            time_values=time_values,
+            parameters=parameters,
+            variables=variables,
+            boundary_conditions=boundary_conditions,
+            old_values=old_values,
+            dt=context.get('dt'),
+            return_details=return_details,
+        )
+        if derivatives is not None:
+            derivatives[name] = evaluation.rhs if return_details else evaluation
+        return evaluation
+
+    def evaluate_registered_operator_rhs(self, y_flat, i_app, p, context, derivatives):
+        for name, state_spec in self.state_equation_specs.items():
+            operator_spec = state_spec.operator
+            if operator_spec is None or name in derivatives:
+                continue
+            if name not in self.operator_pipeline:
+                continue
+
+            self.evaluate_operator_state(name, y_flat, i_app, p, context, derivatives=derivatives)
+        return derivatives
 
     def _build_electrolyte_mesh(self, p0):
         region_spec = {
@@ -248,279 +434,12 @@ class BatteryPhysics(torch.nn.Module):
         return V_conc
 
     def get_circuit_parameters(self, y_batch):
-        p = self.params
-        cs_n = self.state(y_batch, 'cs_n')
-        cs_p = self.state(y_batch, 'cs_p')
-        ce_eps = self.state(y_batch, 'electrolyte')
-        T_cell = self.state(y_batch, 'temperature')
-        
-        if self.sei_enabled:
-            Lsei = self.state(y_batch, 'Lsei')
-        else:
-            Lsei = p['Lsei_0'] * torch.ones_like(T_cell)
-        
-        theta_n = cs_n[:, -1:] / p['cs_max_n']
-        theta_p = cs_p[:, -1:] / p['cs_max_p']
-        Un = self.calculate_ocp(theta_n, 'anode')
-        Up = self.calculate_ocp(theta_p, 'cathode')
-        OCV = Up - Un
-        
-        V_conc_list = []
-        R_elec_list = []
-        for i in range(y_batch.shape[0]):
-             p_i = {k: v[i] for k, v in p.items()}
-             V_conc_list.append(self.calculate_conc_overpotential(ce_eps[i], T_cell[i], p_i))
-             R_elec_list.append(self.calculate_electrolyte_physics(ce_eps[i], p_i))
-             
-        V_conc = torch.stack(V_conc_list).reshape(-1, 1)
-        R_electrolyte = torch.stack(R_elec_list).reshape(-1, 1)
-
-        inv_T = 1.0 / T_cell
-        inv_T_ref = 1.0 / 298.15
-        arr_n = torch.exp(p['E_r_n'] / p['R_g'] * (inv_T_ref - inv_T))
-        arr_p = torch.exp(p['E_r_p'] / p['R_g'] * (inv_T_ref - inv_T))
-        
-        ce_real_batch = ce_eps / (self.eps_vec.unsqueeze(0) + 1e-12)
-        
-        W_n_batch = self.W_n.unsqueeze(0)
-        W_p_batch = self.W_p.unsqueeze(0)
-        
-        sqrt_ce_n = torch.sum(torch.sqrt(torch.clamp(ce_real_batch[:, :self.Nx_n], min=1e-12)) * W_n_batch, dim=1, keepdim=True)
-        sqrt_ce_p = torch.sum(torch.sqrt(torch.clamp(ce_real_batch[:, -self.Nx_p:], min=1e-12)) * W_p_batch, dim=1, keepdim=True)
-
-        j0_n = p['m_ref_n'] * arr_n * sqrt_ce_n * torch.sqrt(torch.clamp(cs_n[:, -1:] * (p['cs_max_n'] - cs_n[:, -1:]), min=1e-12))
-        j0_p = p['m_ref_p'] * arr_p * sqrt_ce_p * torch.sqrt(torch.clamp(cs_p[:, -1:] * (p['cs_max_p'] - cs_p[:, -1:]), min=1e-12))
-        
-        I0_n = j0_n * p['A'] * p['Ln'] * p['as_n']
-        I0_p = j0_p * p['A'] * p['Lp'] * p['as_p']
-
-        R_solid_ohm = (p['Ln']/p['sigma_n'] + p['Lp']/p['sigma_p'])/(3.0 * p['A'])
-        R_sei = Lsei / (p['as_n'] * p['A'] * p['Ln'] * p['kappa_sei'])
-        R_series = R_solid_ohm + R_electrolyte + R_sei 
-        
-        return OCV, R_series, I0_n, I0_p, T_cell, V_conc
+        import electrochemistry
+        return electrochemistry.get_circuit_parameters(self, y_batch)
     
     def compute_derivatives_functional(self, y_flat, I_app, p, y_old=None, dt=None):
-        cs_n = self.state(y_flat, 'cs_n')
-        cs_p = self.state(y_flat, 'cs_p')
-        ce_eps = self.state(y_flat, 'electrolyte')
-        T_cell = self.state(y_flat, 'temperature')
-        
-        if self.sei_enabled:
-            Lsei = self.state(y_flat, 'Lsei')
-        else:
-            Lsei = p['Lsei_0'] * torch.ones_like(T_cell)
-        
-        inv_T = 1.0 / T_cell
-        inv_T_ref = 1.0 / 298.15
-        arr_n = torch.exp(p['E_r_n'] / p['R_g'] * (inv_T_ref - inv_T))
-        arr_p = torch.exp(p['E_r_p'] / p['R_g'] * (inv_T_ref - inv_T))
-        
-        theta_n = cs_n[-1:] / p['cs_max_n']
-        theta_p = cs_p[-1:] / p['cs_max_p']
-        Un = self.calculate_ocp(theta_n, 'anode')
-        Up = self.calculate_ocp(theta_p, 'cathode')
-        OCV = Up - Un
-        
-        R_electrolyte = self.calculate_electrolyte_physics(ce_eps, p)
-        V_conc = self.calculate_conc_overpotential(ce_eps, T_cell, p)
-        
-        R_sei = Lsei / (p['as_n'] * p['A'] * p['Ln'] * p['kappa_sei'])
-        R_solid_ohm = (p['Ln']/p['sigma_n'] + p['Lp']/p['sigma_p'])/(3.0 * p['A'])
-        V_ohm_total = I_app * (R_solid_ohm + R_electrolyte + R_sei)
-        
-        ce_real = ce_eps / (self.eps_vec + 1e-12)
-        sqrt_ce_n_avg = torch.sum(torch.sqrt(torch.clamp(ce_real[:self.Nx_n], min=1e-12)) * self.W_n)
-        sqrt_ce_p_avg = torch.sum(torch.sqrt(torch.clamp(ce_real[-self.Nx_p:], min=1e-12)) * self.W_p)
-        
-        j0_n = p['m_ref_n'] * arr_n * sqrt_ce_n_avg * torch.sqrt(torch.clamp(cs_n[-1] * (p['cs_max_n'] - cs_n[-1]), min=1e-12))
-        j0_p = p['m_ref_p'] * arr_p * sqrt_ce_p_avg * torch.sqrt(torch.clamp(cs_p[-1] * (p['cs_max_p'] - cs_p[-1]), min=1e-12))
-        
-        term_RTF = 2 * p['R_g'] * T_cell / p['F']
-        phi_s_n = Un - I_app * R_sei
-
-        # ==========================================
-        # Stress-Coupled SEI Cracking
-        # ==========================================
-        E_sei = 10e9
-        nu_sei = 0.25
-        E_sei_b = E_sei / (1.0 - nu_sei)
-        Omega = 3.17e-6
-        sigma_intr = -0.5e9
-        E_g = 15e9
-        nu_g = 0.3
-        pf = E_g * Omega / (3.0 * (1.0 - nu_g))
-
-        c_surf = cs_n[-1]
-        c_surf_ref = 0.8 * p['cs_max_n']
-
-        r_ref = self.r_n_ref
-        r_faces = torch.zeros(self.Nr_n + 1, device=self.device, dtype=torch.float64)
-        r_faces[1:-1] = 0.5 * (r_ref[:-1] + r_ref[1:])
-        r_faces[-1] = 1.0
-        v = r_faces[1:]**3 - r_faces[:-1]**3
-        cv = torch.sum(v)
-        c_bar = torch.sum(cs_n * v) / cv
-
-        sth_surf = 3.0 * pf * (c_bar - c_surf)
-        sigma_sei = E_sei_b * (Omega / 3.0) * (c_surf - c_surf_ref) + sigma_intr
-        total_surf_stress = sth_surf + sigma_sei
-
-        K_Ic = 0.3e6
-        # Threshold: K_Ic / sqrt(pi * Lsei)
-        sigma_crack_threshold = K_Ic / torch.sqrt(torch.pi * torch.clamp(Lsei, min=1e-10))
-        
-        # Smooth transition for Newton solver stability (cracks when stress > threshold)
-        crack_flag = 0.5 * (1.0 + torch.tanh((total_surf_stress - sigma_crack_threshold) / 1e5))
-        stress_enhancement = 1.0 + 3.0 * crack_flag
-
-        i_side_base = 165.96e-6*torch.exp(-6.3e9*Lsei)*torch.exp(-0.55*p['F']*(phi_s_n-p['Us'])/(p['R_g']*T_cell))  + p['F']*(3.7398e-15/Lsei)*0.015*torch.exp(-Un*p['F']/(p['R_g']*T_cell))
-        
-        # Multiply the side current by the enhancement factor to simulate fresh graphite exposure
-        i_side = i_side_base * stress_enhancement
-        
-        g_side = p['as_n']*p['Ln']*p['A'] * i_side
-        dLsei_dt = i_side * p['Msei'] / (2*p['F']*p['rho_sei'])
-        
-        i_n = (I_app) / (p['as_n'] * p['A'] * p['Ln'])
-        i_p = -I_app / (p['as_p'] * p['A'] * p['Lp'])
-        eta_n = term_RTF * torch.asinh(i_n / (2*j0_n + 1e-12))
-        eta_p = term_RTF * torch.asinh(i_p / (2*j0_p + 1e-12))
-        V_rxn = eta_n - eta_p
-        
-        V_cell = OCV - V_rxn - V_ohm_total - V_conc
-        Q_gen = I_app * (OCV - V_cell)
-        dT_dt = Q_gen / (p['rho_Cp'] * p['Vol_cell'])
-
-        # ==========================================
-        # 1. Solid Concentration PDE (Chebyshev)
-        # ==========================================
-        Dr_n = self.Dr_n_ref / p['Rs_n']
-        D2r_n = self.D2r_n_ref / (p['Rs_n']**2)
-        r_n = self.r_n_ref * p['Rs_n']
-        
-        r_safe_n = r_n.clone(); r_safe_n[0] = 1.0 # Protect div zero, index 0 is L'hopital
-        t1_n = torch.mv(D2r_n, cs_n)
-        t2_n = (2.0 / r_safe_n) * torch.mv(Dr_n, cs_n)
-        dcs_n = p['Ds_n'] * (t1_n + t2_n)
-        dcs_n[0] = 3.0 * p['Ds_n'] * t1_n[0] # L'hopital exactly applies here
-        
-        Dr_p = self.Dr_p_ref / p['Rs_p']
-        D2r_p = self.D2r_p_ref / (p['Rs_p']**2)
-        r_p = self.r_p_ref * p['Rs_p']
-        
-        r_safe_p = r_p.clone(); r_safe_p[0] = 1.0
-        t1_p = torch.mv(D2r_p, cs_p)
-        t2_p = (2.0 / r_safe_p) * torch.mv(Dr_p, cs_p)
-        dcs_p = p['Ds_p'] * (t1_p + t2_p)
-        dcs_p[0] = 3.0 * p['Ds_p'] * t1_p[0]
-
-        # Flux Constraints
-        flux_n = -(I_app - g_side) / (p['A'] * p['Ln'] * p['F'] * p['as_n'])
-        BC_rn_surf = torch.dot(Dr_n[-1, :], cs_n) - flux_n / p['Ds_n']
-        BC_rn_cent = torch.dot(Dr_n[0, :], cs_n) 
-        
-        flux_p = I_app / (p['A'] * p['Lp'] * p['F'] * p['as_p'])
-        BC_rp_surf = torch.dot(Dr_p[-1, :], cs_p) - flux_p / p['Ds_p']
-        BC_rp_cent = torch.dot(Dr_p[0, :], cs_p)
-
-        # ==========================================
-        # 2. Electrolyte Concentration PDE (Chebyshev)
-        # ==========================================
-        ce_n = ce_real[:self.Nx_n]
-        ce_s = ce_real[self.Nx_n:self.Nx_n+self.Nx_s]
-        ce_p = ce_real[-self.Nx_p:]
-        
-        def get_Deff(c, eps):
-            c_m = c / 1000.0
-            return (8.79e-11*c_m**2 - 3.97e-10*c_m + 4.86e-10) * (eps**p['b'])
-            
-        Deff_n = get_Deff(ce_n, p['eps_e_n'])
-        Deff_s = get_Deff(ce_s, p['eps_e_s'])
-        Deff_p = get_Deff(ce_p, p['eps_e_p'])
-        
-        Dx_n = self.Dx_n_ref / p['Ln']
-        Dx_s = self.Dx_s_ref / p['Ls']
-        Dx_p = self.Dx_p_ref / p['Lp']
-
-        s_coeff = (1.0 - p['t_plus']) / (p['A'] * p['F'])
-        src_n = s_coeff * I_app / p['Ln']
-        src_p = -s_coeff * I_app / p['Lp']
-
-        ce_state = torch.cat([ce_n, ce_s, ce_p])
-        deff_state = torch.cat([-Deff_n, -Deff_s, -Deff_p])
-        src_state = torch.cat([
-            torch.ones_like(ce_n) * src_n,
-            torch.zeros_like(ce_s),
-            torch.ones_like(ce_p) * src_p
-        ])
-        if self.discretization_methods['electrolyte'] == 'finite_volume':
-            face_coefficients = self.electrolyte_operators.face_coefficients(deff_state)
-            flux_coefficient = lambda ctx, coeff=deff_state: ctx.operators.face_coefficients(coeff)
-            flux_state = face_coefficients * self.electrolyte_operators.gradient(ce_state)
-        else:
-            flux_coefficient = deff_state
-            flux_state = deff_state * self.electrolyte_operators.gradient(ce_state)
-        dce = self.electrolyte_model.evaluate(
-            ce_state,
-            flux_coefficient=flux_coefficient,
-            source=src_state
-        )
-
-        # ==========================================
-        # 3. DAE Constraint Embedding 
-        # ==========================================
-        dcs_n_out = dcs_n.clone()
-        dcs_p_out = dcs_p.clone()
-        dce_out = dce.clone()
-
-        if y_old is not None and dt is not None:
-            # Overwrite Boundary Time Derivatives with Algebraic Constraints
-            # Mathematically: R = y - y_o - dt * dy
-            # If dy = (y - y_o)/dt - BC/dt --> R = BC
-            y_o_cs_n = self.state(y_old, 'cs_n')
-            y_o_cs_p = self.state(y_old, 'cs_p')
-            ce_o = self.state(y_old, 'electrolyte')
-            
-            dcs_n_out[0]  = (cs_n[0] - y_o_cs_n[0])/dt - BC_rn_cent/dt
-            dcs_n_out[-1] = (cs_n[-1] - y_o_cs_n[-1])/dt - BC_rn_surf/dt
-            
-            dcs_p_out[0]  = (cs_p[0] - y_o_cs_p[0])/dt - BC_rp_cent/dt
-            dcs_p_out[-1] = (cs_p[-1] - y_o_cs_p[-1])/dt - BC_rp_surf/dt
-
-            dce_out = self.electrolyte_model.apply_chebyshev_boundary_constraints(
-                ce=ce_state,
-                dce=dce_out,
-                flux=flux_state,
-                ce_old=ce_o,
-                dt=dt,
-                boundary_conditions={
-                    'left': {'type': 'neumann', 'value': torch.tensor(0.0, device=self.device, dtype=torch.float64)},
-                    'right': {'type': 'neumann', 'value': torch.tensor(0.0, device=self.device, dtype=torch.float64)}
-                },
-            )
-
-        derivatives = {
-            'cs_n': dcs_n_out,
-            'cs_p': dcs_p_out,
-            'electrolyte': dce_out,
-            'temperature': dT_dt,
-        }
-        if self.sei_enabled:
-            derivatives['sei'] = torch.zeros(self.Nsei, device=self.device, dtype=y_flat.dtype)
-            derivatives['Lsei'] = dLsei_dt
-        context = {
-            'ce_state': ce_state,
-            'ce_real': ce_real,
-            'y_old': y_old,
-            'dt': dt,
-            'dcs_n': dcs_n_out,
-            'dcs_p': dcs_p_out,
-            'dce': dce_out,
-            'dT_dt': dT_dt,
-        }
-        evaluate_registered_rhs(self, y_flat, I_app, p, context, derivatives)
-        return self.state_layout.pack(derivatives, device=self.device, dtype=y_flat.dtype)
+        import electrochemistry
+        return electrochemistry.compute_derivatives_functional(self, y_flat, I_app, p, y_old, dt)
 
     def batched_derivatives(self, y_batch, I_batch, y_old_batch=None, dt=None):
         if y_old_batch is not None:
@@ -814,16 +733,31 @@ class ImplicitBatterySolver:
         return False, None, None, None
 
     def simulate(self, t_end, dt_init, I_pack=None, method='basic', controller=None, dt_max=None):
-        if controller is not None:
-            self.controlled_solver.simulate(t_end, dt_init, controller, dt_max=dt_max)
-            return
+        import sys
+        import os
+        
+        run_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+        if not run_name or run_name == '-c': 
+            run_name = 'default_run'
+            
+        out_dir = os.path.join(os.getcwd(), 'simulation_result', run_name, 'results')
+        os.makedirs(out_dir, exist_ok=True)
+        
+        old_cwd = os.getcwd()
+        os.chdir(out_dir)
+        try:
+            if controller is not None:
+                self.controlled_solver.simulate(t_end, dt_init, controller, dt_max=dt_max)
+                return
 
-        if method == 'basic':
-            self.basic_solver.simulate(t_end, dt_init, I_pack)
-        elif method == 'advanced':
-            self.advanced_solver.simulate(t_end, dt_init, I_pack)
-        else:
-            raise ValueError("Method must be 'basic' or 'advanced'")
+            if method == 'basic':
+                self.basic_solver.simulate(t_end, dt_init, I_pack)
+            elif method == 'advanced':
+                self.advanced_solver.simulate(t_end, dt_init, I_pack)
+            else:
+                raise ValueError("Method must be 'basic' or 'advanced'")
+        finally:
+            os.chdir(old_cwd)
 
     def _build_thermal_connection_matrix(self, k_contact=0.5, area=0.005, dist=0.02):
         G = torch.zeros((self.n_cells, self.n_cells))

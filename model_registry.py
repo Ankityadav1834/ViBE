@@ -2,6 +2,16 @@ from dataclasses import dataclass, field
 
 import torch
 
+from pde_framework import (
+    BoundaryCondition,
+    Div,
+    Grad,
+    OperatorEquationSpec,
+    Parameter,
+    Variable,
+    spherical_diffusion_expression,
+)
+
 
 def context_value(fn):
     """
@@ -44,6 +54,27 @@ def sei_enabled(config):
     return bool(config.get("sei_options", {}).get("enabled", True))
 
 
+def context_item(name):
+    def resolver(_physics, _y_flat, _i_app, _p, context):
+        return context[name]
+
+    return resolver
+
+
+def parameter_item(name):
+    def resolver(_physics, _y_flat, _i_app, p, _context):
+        return p[name]
+
+    return resolver
+
+
+def state_item(name):
+    def resolver(physics, y_flat, _i_app, _p, _context):
+        return physics.state(y_flat, name)
+
+    return resolver
+
+
 @dataclass(frozen=True)
 class StateEquationSpec:
     """
@@ -63,6 +94,7 @@ class StateEquationSpec:
     options_key: str = None
     rhs: object = None
     dependencies: tuple = ()
+    operator: object = None
     discretization: dict = field(default_factory=dict)
     boundary_conditions: dict = field(default_factory=dict)
     equation: str = ""
@@ -107,17 +139,113 @@ class DerivedOutputSpec:
         return bool(self.enabled)
 
 
-def stress_rhs(physics, y_flat, _i_app, p, context):
+def stress_flux_coefficient(physics, y_flat, _i_app, _p, _context):
     options = physics.state_equation_options.get("stress", {})
     stress = physics.state(y_flat, "stress")
-    ce_state = context["ce_state"]
-
     diffusivity = torch.ones_like(stress) * float(options.get("diffusivity", 1e-12))
+    return physics.through_cell_flux_coefficient(diffusivity)
+
+
+def stress_source(physics, y_flat, _i_app, p, context):
+    options = physics.state_equation_options.get("stress", {})
+    ce_state = context["ce_state"]
     relaxation = float(options.get("relaxation", 1e-4))
     coupling = float(options.get("coupling", 1.0))
-    source = coupling * (ce_state - p["ce_0"]) - relaxation * stress
+    stress = physics.state(y_flat, "stress")
+    return coupling * (ce_state - p["ce_0"]) - relaxation * stress
 
-    return physics.evaluate_diffusion_source_rhs(stress, diffusivity, source)
+
+def cs_n_surface_gradient(_physics, _y_flat, _i_app, p, context):
+    return context["flux_n"] / p["Ds_n"]
+
+
+def cs_p_surface_gradient(_physics, _y_flat, _i_app, p, context):
+    return context["flux_p"] / p["Ds_p"]
+
+
+def sei_rhs(physics, y_flat, _i_app, _p, _context):
+    return torch.zeros(physics.Nsei, device=physics.device, dtype=y_flat.dtype)
+
+
+def lsei_rhs(_physics, _y_flat, _i_app, _p, context):
+    return context["dLsei_dt"]
+
+
+def temperature_rhs(_physics, _y_flat, _i_app, _p, context):
+    return context["dT_dt"]
+
+
+def spherical_particle_operator(state_name, domain):
+    if state_name == "cs_n":
+        diffusivity = parameter_item("Ds_n")
+        radius = parameter_item("Rs_n")
+        surface_value = cs_n_surface_gradient
+    elif state_name == "cs_p":
+        diffusivity = parameter_item("Ds_p")
+        radius = parameter_item("Rs_p")
+        surface_value = cs_p_surface_gradient
+    else:
+        diffusivity = parameter_item("diffusivity")
+        radius = parameter_item("radius")
+        surface_value = 0.0
+
+    return OperatorEquationSpec(
+        state_name=state_name,
+        variable_name=state_name,
+        domain=domain,
+        evaluator="spherical_particle",
+        method="chebyshev",
+        rhs=spherical_diffusion_expression(state_name),
+        parameters={
+            "diffusivity": diffusivity,
+            "particle_radius": radius,
+        },
+        boundary_conditions={
+            "center": BoundaryCondition("neumann", 0.0),
+            "surface": BoundaryCondition("neumann", surface_value),
+        },
+    )
+
+
+def through_cell_flux_operator(
+    state_name,
+    variable_name=None,
+    parameters=None,
+    values=None,
+    time_values=None,
+    flux=None,
+    source=None,
+):
+    variable_name = variable_name or state_name
+    flux = flux or (Parameter("flux_coefficient") * Grad(Variable(variable_name)))
+    source = source or Parameter("source")
+    return OperatorEquationSpec(
+        state_name=state_name,
+        variable_name=variable_name,
+        domain="through_cell",
+        evaluator="conservative",
+        method="config['electrolyte_spatial_method']",
+        rhs=-Div(flux) + source,
+        values=values,
+        time_values=time_values,
+        parameters=parameters or {},
+        flux=flux,
+        source=source,
+        boundary_conditions={
+            "left": BoundaryCondition("neumann", 0.0),
+            "right": BoundaryCondition("neumann", 0.0),
+        },
+    )
+
+
+def through_cell_diffusion_operator(state_name, variable_name=None, parameters=None, values=None, time_values=None):
+    return through_cell_flux_operator(
+        state_name,
+        variable_name=variable_name,
+        parameters=parameters,
+        values=values,
+        time_values=time_values,
+    )
 
 
 STATE_EQUATIONS = {
@@ -127,6 +255,7 @@ STATE_EQUATIONS = {
         initial=29866.0,
         scale=30000.0,
         nonnegative=True,
+        operator=spherical_particle_operator("cs_n", "negative_particle"),
         equation="dcs_n/dt = Ds_n * (d2cs_n/dr2 + 2/r * dcs_n/dr)",
         notes="Negative-electrode solid concentration. Core RHS is computed in BatteryPhysics.",
         discretization={
@@ -145,6 +274,7 @@ STATE_EQUATIONS = {
         initial=17038.0,
         scale=30000.0,
         nonnegative=True,
+        operator=spherical_particle_operator("cs_p", "positive_particle"),
         equation="dcs_p/dt = Ds_p * (d2cs_p/dr2 + 2/r * dcs_p/dr)",
         notes="Positive-electrode solid concentration. Core RHS is computed in BatteryPhysics.",
         discretization={
@@ -164,6 +294,16 @@ STATE_EQUATIONS = {
         scale=1000.0,
         nonnegative=True,
         dependencies=("cs_n", "cs_p"),
+        operator=through_cell_diffusion_operator(
+            "electrolyte",
+            variable_name="ce",
+            values=context_item("ce_state"),
+            time_values=state_item("electrolyte"),
+            parameters={
+                "flux_coefficient": context_item("electrolyte_flux_coefficient"),
+                "source": context_item("electrolyte_source"),
+            },
+        ),
         equation="delectrolyte/dt = -Div(-Deff * Grad(ce)) + reaction_source",
         notes="Through-cell electrolyte concentration times porosity. Core RHS is computed in BatteryPhysics.",
         discretization={
@@ -185,7 +325,13 @@ STATE_EQUATIONS = {
         nonnegative=False,
         enabled=stress_enabled,
         options_key="stress_options",
-        rhs=stress_rhs,
+        operator=through_cell_diffusion_operator(
+            "stress",
+            parameters={
+                "flux_coefficient": stress_flux_coefficient,
+                "source": stress_source,
+            },
+        ),
         dependencies=("electrolyte",),
         equation="dstress/dt = -Div(-D_stress * Grad(stress)) + coupling*(ce - ce_0) - relaxation*stress",
         notes="Example add-on PDE. Add another entry like this for a new coupled state.",
@@ -207,6 +353,7 @@ STATE_EQUATIONS = {
         nonnegative=True,
         enabled=sei_enabled,
         options_key="sei_options",
+        rhs=sei_rhs,
         equation="dsei/dt = 0",
         notes="Reserved SEI state vector. Current model keeps it algebraic/zero RHS.",
     ),
@@ -219,6 +366,7 @@ STATE_EQUATIONS = {
         enabled=sei_enabled,
         options_key="sei_options",
         dependencies=("cs_n",),
+        rhs=lsei_rhs,
         equation="dLsei/dt = i_side * Msei / (2 * F * rho_sei)",
         notes="SEI thickness evolved by the core side-reaction model.",
     ),
@@ -228,6 +376,7 @@ STATE_EQUATIONS = {
         initial="T_amb",
         scale=300.0,
         nonnegative=True,
+        rhs=temperature_rhs,
         equation="dT/dt = heat_generation / (rho_Cp * Vol_cell) plus pack thermal coupling",
         notes="Cell temperature. Kept last because the solver adds pack thermal coupling to the last state.",
     ),

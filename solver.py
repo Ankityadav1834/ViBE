@@ -121,52 +121,51 @@ class BasicSolver:
                 if dt <= dt_min:
                     print("ERROR: Minimum time step reached. Physics are too stiff to converge.")
                     break
+
                     
         print(f"Complete in {time.time()-start_time:.2f}s")
         self.process_results(times, y_hist, I_pack)
 
     def _get_voltage_breakdown_numpy(self, y_cell, I_cell, p):
-        Nr_n, Nr_p, Nel = self.battery.physics.Nr_n, self.battery.physics.Nr_p, self.battery.physics.Nel
-        cs_n, cs_p, ce_eps = y_cell[:Nr_n], y_cell[Nr_n:Nr_n+Nr_p], y_cell[Nr_n+Nr_p:Nr_n+Nr_p+Nel]
-        Lsei, T_cell = y_cell[-2], y_cell[-1]
-        
-        sto_n, sto_p = np.clip(cs_n[-1]/p['cs_max_n'], 1e-4, 0.999), np.clip(cs_p[-1]/p['cs_max_p'], 1e-4, 0.999)
-        def ocp_n(s): return 1.9793*np.exp(-39.3631*s)+0.2482-0.0909*np.tanh(29.8538*(s-0.1234))-0.04478*np.tanh(14.9159*(s-0.2769))-0.0205*np.tanh(30.4444*(s-0.6103))
-        def ocp_p(s): return -0.8090*s+4.4875-0.0428*np.tanh(18.5138*(s-0.5542))-17.7326*np.tanh(15.7890*(s-0.3117))+17.5842*np.tanh(15.9308*(s-0.3120))
-        OCV = ocp_p(sto_p) - ocp_n(sto_n)
-        
-        inv_T, inv_Ref = 1.0/T_cell, 1.0/298.15
-        arr_n = np.exp(p['E_r_n']/p['R_g'] * (inv_Ref - inv_T))
-        arr_p = np.exp(p['E_r_p']/p['R_g'] * (inv_Ref - inv_T))
-        
-        ce_real = ce_eps / (self.battery.physics.eps_vec.cpu().numpy() + 1e-12)
-        c_k = ce_real / 1000.0
-        local_kappa = (0.1297 * c_k**3 - 2.51 * c_k**1.5 + 3.329 * c_k)
-        
-        W_n, W_s, W_p = self.battery.physics.W_n.cpu().numpy(), self.battery.physics.W_s.cpu().numpy(), self.battery.physics.W_p.cpu().numpy()
-        
-        int_inv_kappa = (p['Ln']*np.sum(W_n / (local_kappa[:self.battery.physics.Nx_n] + 1e-12)) +
-                         p['Ls']*np.sum(W_s / (local_kappa[self.battery.physics.Nx_n:self.battery.physics.Nx_n+self.battery.physics.Nx_s] + 1e-12)) +
-                         p['Lp']*np.sum(W_p / (local_kappa[-self.battery.physics.Nx_p:] + 1e-12)))
-        
-        eff_kappa = (p['Ln'] + p['Ls'] + p['Lp']) / (int_inv_kappa + 1e-12)
-        R_eff_term = (p['Ln'] / (3 * p['eps_e_n'] ** p['b']) + p['Ls'] / (p['eps_e_s'] ** p['b']) + p['Lp'] / (3 * p['eps_e_p'] ** p['b']))
-        V_ohm_elec = (I_cell / p['A']) / (eff_kappa + 1e-9) * R_eff_term
-        
-        R_sei = Lsei / (p['as_n'] * p['A'] * p['Ln'] * p['kappa_sei'])
-        V_sei = I_cell * R_sei
-        R_solid_ohm = (p['Ln']/p['sigma_n'] + p['Lp']/p['sigma_p'])/(3*p['A'])
-        V_ohm_solid = I_cell * R_solid_ohm
-        
-        j0_n = p['m_ref_n']*arr_n * np.sum(np.sqrt(np.maximum(1e-12, ce_real[:self.battery.physics.Nx_n]))*W_n) * np.sqrt(np.maximum(1e-12, cs_n[-1]*(p['cs_max_n']-cs_n[-1])))
-        j0_p = p['m_ref_p']*arr_p * np.sum(np.sqrt(np.maximum(1e-12, ce_real[-self.battery.physics.Nx_p:]))*W_p) * np.sqrt(np.maximum(1e-12, cs_p[-1]*(p['cs_max_p']-cs_p[-1])))
-        term = 2*p['R_g']*T_cell/p['F']
-        V_rxn = term*np.arcsinh(I_cell/(2*p['A']*p['Ln']*p['as_n']*j0_n+1e-12)) - term*np.arcsinh(-I_cell/(2*p['A']*p['Lp']*p['as_p']*j0_p+1e-12))
-        
-        ln_ce = np.log(np.maximum(ce_real, 1e-6))
-        V_conc = term * (1.0-p['t_plus']) * (np.sum(ln_ce[:self.battery.physics.Nx_n]*W_n) - np.sum(ln_ce[-self.battery.physics.Nx_p:]*W_p))
-        V_term = OCV - V_rxn - V_ohm_solid - V_ohm_elec - V_conc - V_sei
-        return {"TermV": V_term, "OCV": OCV, "Rxn": V_rxn, "OhmSolid": V_ohm_solid, "OhmElec": V_ohm_elec, "Conc": V_conc, "SEI": V_sei}
+        # Use PyTorch pipeline for exact results
+        with torch.no_grad():
+            y_t = torch.from_numpy(y_cell).unsqueeze(0).to(self.battery.device)
+            # Override physics parameters temporarily if multiple cells differ, 
+            # but usually get_circuit_parameters takes the whole batch.
+            # To be safe and exact, we just query it for a single cell:
+            OCV_t, R_series_t, I0_n_t, I0_p_t, T_cell_t, V_conc_t = self.battery.physics.get_circuit_parameters(y_t)
+            
+            # Since get_circuit_parameters returns for all cells, we just take the first one 
+            # (assuming homogeneous params for this debug plot, or we reshape)
+            # Actually y_t has shape (1, len), get_circuit_parameters returns (1, n_cells) or (1,).
+            # To avoid shape mismatch, let's just compute terms manually from the returned tensors:
+            term_RTF = 2 * p['R_g'] * T_cell_t[0].item() / p['F']
+            denom_n = 2 * I0_n_t[0].item() * p['A'] * p['Ln'] * p['as_n']
+            denom_p = 2 * I0_p_t[0].item() * p['A'] * p['Lp'] * p['as_p']
+            
+            V_rxn = term_RTF * (np.arcsinh(I_cell / (denom_n + 1e-12)) - np.arcsinh(-I_cell / (denom_p + 1e-12)))
+            V_conc = V_conc_t[0].item()
+            OCV = OCV_t[0].item()
+            V_ohm_elec_and_solid = I_cell * R_series_t[0].item()
+            
+            # Approximations for breakdown plot
+            R_solid_ohm = (p['Ln']/p['sigma_n'] + p['Lp']/p['sigma_p'])/(3*p['A'])
+            V_ohm_solid = I_cell * R_solid_ohm
+            V_ohm_elec = V_ohm_elec_and_solid - V_ohm_solid
+            
+            if 'Lsei' in self.battery.physics.state_layout.slices:
+                Lsei = self.battery.physics.state(y_t.squeeze(0), 'Lsei')[0].item()
+            else:
+                Lsei = p['Lsei_0']
+            V_sei = I_cell * (Lsei / (p['as_n'] * p['A'] * p['Ln'] * p['kappa_sei']))
+            
+            V_term = OCV - V_rxn - V_ohm_elec_and_solid - V_conc - V_sei
+            
+        return {
+            "TermV": V_term, "OCV": OCV, "Rxn": V_rxn, 
+            "OhmSolid": V_ohm_solid, "OhmElec": V_ohm_elec, 
+            "Conc": V_conc, "SEI": V_sei
+        }
 
     def process_results(self, times, y_list, I_pack):
         self.battery.output_manager.save(times, y_list, I_pack, filename='all_results.csv')
@@ -591,9 +590,17 @@ class ControlledSolver:
                     res['OhmE'][i, k] = bd['OhmElec']
                     res['Conc'][i, k] = bd['Conc']
                     res['SEI'][i, k] = bd['SEI']
-                    res['Temp'][i, k] = y_c[-1]
-                    res['SEI_Thick'][i, k] = y_c[-2] * 1e9
-                    res['SOC'][i, k] = (y_c[self.battery.physics.Nr_n - 1] / p['cs_max_n'] - 0.01) / 0.94
+                    y_t_single = torch.from_numpy(y_c).unsqueeze(0).to(self.battery.device)
+                    res['Temp'][i, k] = self.battery.physics.state(y_t_single, 'temperature')[0].item()
+                    if 'Lsei' in self.battery.physics.state_layout.slices:
+                        res['SEI_Thick'][i, k] = self.battery.physics.state(y_t_single, 'Lsei')[0].item() * 1e9
+                    else:
+                        res['SEI_Thick'][i, k] = p['Lsei_0'] * 1e9
+                    
+                    cs_n_state = self.battery.physics.state(y_t_single, 'cs_n')[0].cpu().numpy()
+                    # Average over x for surface SOC
+                    surf_cs_n = np.mean(cs_n_state[self.battery.physics.Nr_n - 1::self.battery.physics.Nr_n])
+                    res['SOC'][i, k] = (surf_cs_n / p['cs_max_n'] - 0.01) / 0.94
                     volts.append(bd['TermV'])
                 res['PackVoltage'][i] = np.sum(
                     np.mean(np.array(volts).reshape(self.battery.n_series, self.battery.n_parallel), axis=1)
