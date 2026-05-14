@@ -1,0 +1,6 @@
+
+# Ignore simulation results and CSVs
+*.csv
+simulation_result/
+__pycache__/
+*.pyc
