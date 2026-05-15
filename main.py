@@ -79,6 +79,11 @@ class BatteryPhysics(torch.nn.Module):
         self.stress_options = self.state_equation_options.get('stress', {})
         self.stress_enabled = 'stress' in self.state_equation_specs
         self.sei_enabled = 'Lsei' in self.state_equation_specs
+        # Physics model selection — read from config, fall back to 'builtin'
+        self.sei_model_name     = config.get('sei_options', {}).get('sei_model', 'builtin')
+        self.stress_model_name  = config.get('stress_options', {}).get('model', 'builtin')
+        self.thermal_model_name = config.get('thermal_options', {}).get('model', 'builtin')
+        self.plating_model_name = config.get('lithium_plating_options', {}).get('model', 'builtin')
         self.state_layout = self._build_state_layout(config)
         self.state_size = self.state_layout.total_size
         

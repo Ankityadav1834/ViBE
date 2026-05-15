@@ -115,47 +115,87 @@ def compute_derivatives_functional(physics, y_flat, I_app, p, y_old=None, dt=Non
     j0_p = p['m_ref_p'] * arr_p * sqrt_ce_p_avg * torch.sqrt(torch.clamp(cs_p[-1] * (p['cs_max_p'] - cs_p[-1]), min=1e-12))
     
     term_RTF = 2 * p['R_g'] * T_cell / p['F']
-    phi_s_n = Un - I_app * R_sei
 
-    E_sei, nu_sei, Omega, sigma_intr, E_g, nu_g = 10e9, 0.25, 3.17e-6, -0.5e9, 15e9, 0.3
-    E_sei_b = E_sei / (1.0 - nu_sei)
-    pf = E_g * Omega / (3.0 * (1.0 - nu_g))
-
-    c_surf = cs_n[-1]
-    c_surf_ref = 0.8 * p['cs_max_n']
-
-    r_ref = physics.r_n_ref
-    r_faces = torch.zeros(physics.Nr_n + 1, device=physics.device, dtype=torch.float64)
-    r_faces[1:-1] = 0.5 * (r_ref[:-1] + r_ref[1:])
-    r_faces[-1] = 1.0
-    v = r_faces[1:]**3 - r_faces[:-1]**3
-    cv = torch.sum(v)
-    c_bar = torch.sum(cs_n * v) / cv
-
-    sth_surf = 3.0 * pf * (c_bar - c_surf)
-    sigma_sei = E_sei_b * (Omega / 3.0) * (c_surf - c_surf_ref) + sigma_intr
-    total_surf_stress = sth_surf + sigma_sei
-
-    K_Ic = 0.3e6
-    sigma_crack_threshold = K_Ic / torch.sqrt(torch.pi * torch.clamp(Lsei, min=1e-10))
-    crack_flag = 0.5 * (1.0 + torch.tanh((total_surf_stress - sigma_crack_threshold) / 1e5))
-    stress_enhancement = 1.0 + 3.0 * crack_flag
-
-    i_side_base = 165.96e-6*torch.exp(-6.3e9*Lsei)*torch.exp(-0.55*p['F']*(phi_s_n-p['Us'])/(p['R_g']*T_cell))  + p['F']*(3.7398e-15/Lsei)*0.015*torch.exp(-Un*p['F']/(p['R_g']*T_cell))
-    i_side = i_side_base * stress_enhancement
-    
-    g_side = p['as_n']*p['Ln']*p['A'] * i_side
-    dLsei_dt = i_side * p['Msei'] / (2*p['F']*p['rho_sei'])
-    
-    i_n = (I_app) / (p['as_n'] * p['A'] * p['Ln'])
+    # ── Intercalation current densities [A/m²] ───────────────────────────────
+    i_n = I_app / (p['as_n'] * p['A'] * p['Ln'])
     i_p = -I_app / (p['as_p'] * p['A'] * p['Lp'])
+
+    # ── 1. Stress model ───────────────────────────────────────────────────────
+    stress_model_name = getattr(physics, 'stress_model_name', 'builtin')
+    if stress_model_name == 'builtin':
+        # Inline for speed (avoids import on every call)
+        E_sei, nu_sei, Omega, sigma_intr = 10e9, 0.25, 3.17e-6, -0.5e9
+        E_g, nu_g = 15e9, 0.3
+        E_sei_b = E_sei / (1.0 - nu_sei)
+        pf = E_g * Omega / (3.0 * (1.0 - nu_g))
+        c_surf = cs_n[-1]
+        c_surf_ref = 0.8 * p['cs_max_n']
+        r_ref = physics.r_n_ref
+        r_faces = torch.zeros(physics.Nr_n + 1, device=physics.device, dtype=torch.float64)
+        r_faces[1:-1] = 0.5 * (r_ref[:-1] + r_ref[1:])
+        r_faces[-1] = 1.0
+        v = r_faces[1:]**3 - r_faces[:-1]**3
+        c_bar = torch.sum(cs_n * v) / torch.sum(v)
+        sth_surf = 3.0 * pf * (c_bar - c_surf)
+        sigma_sei = E_sei_b * (Omega / 3.0) * (c_surf - c_surf_ref) + sigma_intr
+        total_surf_stress = sth_surf + sigma_sei
+        K_Ic = 0.3e6
+        sigma_crack_threshold = K_Ic / torch.sqrt(torch.pi * torch.clamp(Lsei, min=1e-10))
+        crack_flag = 0.5 * (1.0 + torch.tanh((total_surf_stress - sigma_crack_threshold) / 1e5))
+        stress_enhancement = 1.0 + 3.0 * crack_flag
+    else:
+        from stress_models import get_stress_model
+        total_surf_stress, stress_enhancement = get_stress_model(stress_model_name)(
+            cs_n, Lsei, physics, p, physics.device)
+
+    # ── 2. SEI model ──────────────────────────────────────────────────────────
+    # phi_s_n: solid potential for reporting/context only.
+    # PyBaMM models compute eta_sei internally using Un and i_n.
+    # Builtin model needs phi_s_n for its legacy formula.
+    phi_s_n = Un - i_n * (Lsei / p['kappa_sei'])  # local potential [V]
+
+    sei_model_name = getattr(physics, 'sei_model_name', 'builtin')
+    if sei_model_name == 'builtin':
+        # Original empirical model (stress-enhanced exponential decay)
+        i_side_base = (165.96e-6 * torch.exp(-6.3e9*Lsei) *
+                       torch.exp(-0.55*p['F']*(phi_s_n-p['Us'])/(p['R_g']*T_cell)) +
+                       p['F'] * (3.7398e-15/Lsei) * 0.015 *
+                       torch.exp(-Un*p['F']/(p['R_g']*T_cell)))
+        i_side   = i_side_base * stress_enhancement            # [A/m²], positive
+        dLsei_dt = i_side * p['Msei'] / (2*p['F']*p['rho_sei'])  # [m/s]
+    else:
+        # PyBaMM-compatible models: return j_sei [A/m²], negative (reduction)
+        from sei_models import get_sei_model
+        j_sei = get_sei_model(sei_model_name)(Lsei, i_n, Un, T_cell, p, physics.device)
+        # Convert j_sei → i_side (positive convention used in rest of code)
+        i_side = -j_sei                                         # [A/m²], positive
+        # PyBaMM growth formula: dL/dt = -(Vbar_sei / (F * z_sei)) * j_sei
+        Vbar_sei = p.get('Vbar_sei', 9.585e-5)                 # m³/mol
+        z_sei    = p.get('z_sei',    2.0)                      # electrons/reaction
+        dLsei_dt = -(Vbar_sei / (p['F'] * z_sei)) * j_sei      # [m/s], positive
+
+    g_side = p['as_n'] * p['Ln'] * p['A'] * i_side             # total side-rxn current [A]
+
+    # ── 3. Butler-Volmer overpotentials ───────────────────────────────────────
     eta_n = term_RTF * torch.asinh(i_n / (2*j0_n + 1e-12))
     eta_p = term_RTF * torch.asinh(i_p / (2*j0_p + 1e-12))
     V_rxn = eta_n - eta_p
-    
+
     V_cell = OCV - V_rxn - V_ohm_total - V_conc
-    Q_gen = I_app * (OCV - V_cell)
-    dT_dt = Q_gen / (p['rho_Cp'] * p['Vol_cell'])
+
+    # ── 4. Thermal model ──────────────────────────────────────────────────────
+    thermal_model_name = getattr(physics, 'thermal_model_name', 'builtin')
+    if thermal_model_name == 'builtin':
+        Q_gen  = I_app * (OCV - V_cell)
+        Q_cool = p['hA'] * (T_cell - p['T_amb'])
+        dT_dt = (Q_gen - Q_cool) / (p['rho_Cp'] * p['Vol_cell'])
+    else:
+        from temperature_models import get_thermal_model
+        dT_dt = get_thermal_model(thermal_model_name)(I_app, OCV, V_cell, T_cell, p, physics.device)
+
+    # ── 5. Lithium plating ────────────────────────────────────────────────────
+    # (dispatched inside states/lithium_plating.py via context['phi_s_n'])
+    # Override phi_s_n in context with the corrected value computed above.
 
     flux_n = -(I_app - g_side) / (p['A'] * p['Ln'] * p['F'] * p['as_n'])
     flux_p = I_app / (p['A'] * p['Lp'] * p['F'] * p['as_p'])
@@ -193,8 +233,10 @@ def compute_derivatives_functional(physics, y_flat, I_app, p, y_old=None, dt=Non
     context = {
         'ce_state': ce_state, 'ce_real': ce_real, 'electrolyte_flux_coefficient': flux_coefficient,
         'electrolyte_source': src_state, 'flux_n': flux_n, 'flux_p': flux_p,
-        'y_old': y_old, 'dt': dt, 'dLsei_dt': dLsei_dt, 'dT_dt': dT_dt, 'phi_s_n': phi_s_n,
-        'deff_state': deff_state, 'src_state': src_state, 'g_side': g_side
+        'y_old': y_old, 'dt': dt, 'dLsei_dt': dLsei_dt, 'dT_dt': dT_dt,
+        'phi_s_n': phi_s_n, 'i_n': i_n,   # i_n correctly normalized by (as_n*A*Ln)
+        'deff_state': deff_state, 'src_state': src_state, 'g_side': g_side,
+        'total_surf_stress': total_surf_stress,
     }
 
     dcs_n_out = physics.evaluate_operator_state('cs_n', y_flat, I_app, p, context)

@@ -1,7 +1,6 @@
 # Move CycleController below imports and other controllers
 import numpy as np
 import torch
-from mpc_controller import FastChargeMPCController
 
 
 class BaseController:
@@ -191,13 +190,10 @@ def build_controller(strategy, **kwargs):
         return CCCVController(**kwargs)
     if strategy == "mpc":
         return MPCBatteryController(**kwargs)
-    if strategy == "fast_charge_mpc":
-        return FastChargeMPCController(**kwargs)
     if strategy == "cycle_cccv":
         return CycleController(**kwargs)
     raise ValueError(
-        "Unknown controller strategy. Use 'constant_current', 'current_profile', "
-        "'cc_cv', 'mpc', 'fast_charge_mpc', or 'cycle_cccv'."
+        "Unknown controller strategy. Use 'constant_current', 'current_profile', 'cc_cv', 'mpc', or 'cycle_cccv'."
     )
 
 # Place CycleController at the end, after all imports and other classes
