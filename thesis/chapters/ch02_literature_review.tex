@@ -194,6 +194,39 @@ A limitation of the liionpack approach is that it requires the PyBaMM electroche
 
 Passive balancing dissipates excess energy in resistor networks (bleed resistors) to equalise cell voltages during charging~\cite{Daowd2011}. Active balancing transfers energy between cells using capacitors or inductors, achieving higher efficiency but at greater complexity~\cite{Baughman2008}. The vast majority of balancing algorithm studies use ECM simulations~\cite{Ouyang2018,Zheng2014}. Only a handful of studies have evaluated balancing strategies using physics-based electrochemical models~\cite{Perez2016}, and none of the open-source frameworks reviewed provide a direct coupling between DFN-class physics and BMS algorithm evaluation.
 
+\section{Sensitivity Analysis of Electrochemical Models}
+\label{sec:lit_sensitivity}
+
+Prior work on electrochemical battery sensitivity analysis has primarily relied on perturbation-based or repeated-simulation approaches because DFN-type electrochemical models are computationally expensive and strongly nonlinear. Several studies perform sensitivity analysis by repeatedly perturbing model parameters and re-running the electrochemical solver to observe changes in outputs such as voltage response, thermal behavior, or parameter identifiability~\cite{Forman2012}.
+
+For example, approaches that estimate parameters of electrochemistry-based lithium-ion battery models using a two-step procedure typically perform sensitivity analysis of DFN parameters to identify which electrochemical parameters can be reliably estimated from current-voltage measurements~\cite{Marcicki2011}. Their approach evaluates parameter importance through repeated DFN simulations under perturbed parameter sets.
+
+Similarly, parameter estimation studies of the Doyle--Fuller--Newman model often use parameter normalization, grouping, and sensitivity analysis to reduce parameter dimensionality and improve parameter estimation robustness~\cite{Kruger2001}. However, the methodology still relies on repeated forward DFN evaluations for parameter perturbations.
+
+Other works have also highlighted the computational burden of DFN sensitivity studies. The computational complexity of DFN models limits their use for large-scale analysis and motivates reduced-order approximations~\cite{Jokar2016}. Model simplifications and their impact on computational complexity have explicitly studied the tradeoff between model accuracy and simulation time~\cite{Moura2017}.
+
+Recent global sensitivity studies of the DFN model also emphasize the difficulty of performing sensitivity analysis on highly nonlinear time-dependent electrochemical systems. Many existing methods become computationally challenging for time-dependent PDE outputs because the DFN model contains strongly coupled nonlinear electrochemical dynamics.
+
+\subsection{Limitations of Perturbation Methods}
+\label{ssec:lit_perturbation_limits}
+
+The primary limitation of these traditional approaches is that computational cost scales linearly with the number of parameters. For a central finite-difference sensitivity study with $N_p$ parameters, $2N_p + 1$ full nonlinear simulations are typically required (one baseline simulation, one positive perturbation, and one negative perturbation for each parameter).
+
+For coupled electrochemical-aging-thermal pack models, this rapidly becomes computationally prohibitive. 
+
+\subsection{Differentiable Electrochemical Physics}
+\label{ssec:lit_differentiable_physics}
+
+Recent differentiable battery modeling work, such as \emph{DiffLiB}~\cite{Wang2024}, highlights the growing importance of differentiable electrochemical simulation frameworks for efficient parameter identification and gradient-based optimization. DiffLiB demonstrated high-fidelity differentiable modeling of lithium-ion batteries.
+
+However, the proposed framework in this thesis extends these concepts toward tensorized pack-level electrochemical-aging simulations with direct differentiable access to coupled multiphysics operators. Instead of perturbing parameters externally and repeatedly solving the PDE system, the framework computes exact local differential sensitivities directly through reverse-mode automatic differentiation. 
+
+All electrochemical operators, constitutive equations, and discretized PDE terms are represented as differentiable tensor computations in PyTorch. The discretized battery model can be written implicitly as $R(\mathbf{y}, \mathbf{p})=0$, where $\mathbf{y}$ is the coupled state vector and $\mathbf{p}$ is the parameter vector.
+
+Differentiating with respect to a parameter $p_i$ yields $\frac{\partial \mathbf{y}}{\partial p_i} = - \left( \frac{\partial R}{\partial \mathbf{y}} \right)^{-1} \frac{\partial R}{\partial p_i}$. Instead of explicitly forming these Jacobians analytically or approximating them numerically using perturbations, automatic differentiation computes the derivative chain automatically through the computational graph. 
+
+For a scalar output quantity $L(\mathbf{y},\mathbf{p})$ such as temperature rise rate ($\dot{T}$) or SEI degradation rate, the framework computes $\frac{\mathrm{d}L}{\mathrm{d}p_i}$ for all parameters simultaneously through a single backward pass. This eliminates truncation error, perturbation-size dependence, numerical cancellation error, and the need for repeated nonlinear solves. This capability is valuable for parameter importance analysis, gradient-based parameter estimation, pack heterogeneity studies, and degradation pathway analysis.
+
 \section{Summary of Literature Gaps}
 \label{sec:lit_summary}
 

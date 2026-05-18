@@ -128,7 +128,7 @@ Starting from an initial guess $\mathbf{y}^{n+1,(0)} = \mathbf{y}^n$ (or a therm
 \end{equation}
 where $\mathbf{J}^{(k)} = \partial \mathbf{R}/\partial \mathbf{y}|_{\mathbf{y}^{(k)}}$ is the Jacobian and $\alpha^{(k)} \in (0,1]$ is a damping factor from the line search.
 
-\subsection{Jacobian Computation via Automatic Differentiation}
+\subsection{Jacobian and Sensitivity Computation via Automatic Differentiation}
 
 The Jacobian is computed using reverse-mode automatic differentiation:
 \begin{equation}
@@ -140,6 +140,12 @@ This avoids hand-deriving the full $N_\text{state} \times N_\text{state}$ Jacobi
   \hat{\mathbf{J}} = \mathbf{J} + \epsilon_d \mathbf{I}, \quad \epsilon_d = 10^{-12}
   \label{eq:jac_regularise}
 \end{equation}
+
+Furthermore, the fully differentiable tensor architecture enables exact local sensitivity analysis without the need for repeated finite-difference perturbations. The discretized battery model can be written implicitly as $R(\mathbf{y}, \mathbf{p})=0$, where $\mathbf{y}$ is the state vector and $\mathbf{p}$ is the parameter vector. Differentiating with respect to a parameter $p_i$ yields:
+\begin{equation}
+  \frac{\partial R}{\partial \mathbf{y}}\frac{\partial \mathbf{y}}{\partial p_i} + \frac{\partial R}{\partial p_i} = \mathbf{0} \quad \implies \quad \frac{\partial \mathbf{y}}{\partial p_i} = - \left( \frac{\partial R}{\partial \mathbf{y}} \right)^{-1} \frac{\partial R}{\partial p_i}
+\end{equation}
+Instead of forming these explicit matrices analytically or numerically approximating them, the reverse-mode automatic differentiation in PyTorch directly computes the exact gradient of any scalar output quantity $L(\mathbf{y}, \mathbf{p})$ (e.g., temperature rise rate, SEI growth rate) with respect to all parameters simultaneously via a single backward pass through the computational graph. This means the computational complexity scales with the number of outputs rather than the number of parameters, making gradient-based parameter estimation and pack heterogeneity studies extremely efficient.
 
 \subsection{Scaled Convergence Criterion}
 

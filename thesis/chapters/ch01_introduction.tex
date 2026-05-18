@@ -82,6 +82,8 @@ The primary objective of this thesis is the design, implementation, and validati
   \item \textbf{Develop physics-based battery management modules} for passive and active cell balancing (capacitor and inductor topologies) and three thermal management strategies (ambient convection, active liquid cooling, and phase-change material), evaluated against full electrochemical physics.
 
   \item \textbf{Demonstrate computational scaling and physical fidelity} through quantitative validation experiments including single-cell comparison with PyBaMM, pack heterogeneity propagation, SEI model comparison, and degradation-aware balancing.
+  
+  \item \textbf{Introduce exact local sensitivity analysis} via reverse-mode automatic differentiation. Unlike perturbation-based methods that scale linearly with the number of parameters, the proposed differentiable framework allows simultaneous gradient computation for all parameters through the coupled PDE system without repeated simulations, enabling efficient sensitivity studies on heterogeneous pack physics.
 \end{enumerate}
 
 \section{Thesis Contributions}
@@ -103,6 +105,8 @@ The original contributions of this thesis are as follows:
   \item[C6 --- Plug-and-Play Degradation Model Registry.] A unified API for SEI, plating, and stress models enables comparison of seven mechanistically distinct SEI formulations within a single simulation framework, using identical electrochemical driving forces.
 
   \item[C7 --- GPU-Batched Implicit Newton Solver with Automatic Differentiation.] The full coupled PDE system is solved using backward-Euler Newton iterations where the Jacobian is computed via reverse-mode automatic differentiation (\texttt{jacrev}) and batched across all cells in parallel using \texttt{vmap}, achieving near-linear GPU scaling with pack size.
+
+  \item[C8 --- Exact Local Sensitivity Analysis.] Leveraging the fully differentiable tensor architecture, the framework provides exact, truncation-error-free local sensitivity gradients (e.g., $\partial \dot{T} / \partial p_i$) of arbitrary model outputs with respect to all physical parameters simultaneously using a single backward pass, eliminating the computational bottleneck of finite-difference perturbation studies.
 \end{description}
 
 \section{Thesis Organisation}
