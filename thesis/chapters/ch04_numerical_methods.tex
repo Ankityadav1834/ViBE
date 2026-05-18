@@ -1,0 +1,217 @@
+%% ============================================================
+%%  CHAPTER 4 — NUMERICAL METHODS
+%% ============================================================
+\chapter{Numerical Methods}
+\label{ch:numerics}
+
+\section{Overview}
+
+The mathematical model of \cref{ch:math_model} consists of a stiff, coupled system of nonlinear PDEs. This chapter derives the discretisation schemes, the Newton--Raphson nonlinear solver, the adaptive timestepping strategy, and the GPU parallelisation approach.
+
+\section{Chebyshev Spectral Collocation for Solid Diffusion}
+\label{sec:cheb_solid}
+
+\subsection{Chebyshev--Gauss--Lobatto Nodes}
+
+The solid particle domain $r \in [0, R_s]$ is mapped to the reference interval $[0,1]$ via $\hat{r} = r/R_s$. The $N$ Chebyshev--Gauss--Lobatto (CGL) nodes on $[0,1]$ are:
+\begin{equation}
+  \hat{r}_i = \frac{1}{2}\left(1 - \cos\frac{\pi i}{N-1}\right), \quad i = 0, 1, \ldots, N-1
+  \label{eq:cgl_nodes}
+\end{equation}
+These nodes cluster near $\hat{r} = 0$ and $\hat{r} = 1$, providing high resolution at the particle centre and surface where gradients are largest.
+
+\subsection{Barycentric Differentiation Matrix}
+
+The first-derivative Chebyshev differentiation matrix $\mathbf{D} \in \mathbb{R}^{N \times N}$ is constructed using the barycentric form for numerical stability~\cite{Trefethen2000}:
+
+\textbf{Step 1.} Compute barycentric weights:
+\begin{equation}
+  w_i = \prod_{j \neq i} (\hat{r}_i - \hat{r}_j)^{-1}
+  \label{eq:bary_weights}
+\end{equation}
+
+\textbf{Step 2.} Off-diagonal entries:
+\begin{equation}
+  D_{ij} = \frac{w_j/w_i}{\hat{r}_i - \hat{r}_j}, \quad i \neq j
+  \label{eq:D_offdiag}
+\end{equation}
+
+\textbf{Step 3.} Diagonal entries (negative sum of row):
+\begin{equation}
+  D_{ii} = -\sum_{j \neq i} D_{ij}
+  \label{eq:D_diag}
+\end{equation}
+
+The second-derivative matrix is $\mathbf{D}^{(2)} = \mathbf{D}^2$. After scaling back to physical coordinates on $[0, R_s]$, the differentiation matrices are $\tilde{\mathbf{D}} = \mathbf{D}/R_s$ and $\tilde{\mathbf{D}}^{(2)} = \mathbf{D}^2/R_s^2$.
+
+\subsection{Spherical Laplacian Discretisation}
+
+The spherical Laplacian $\mathcal{L}c_s = r^{-2}(r^2 c_s')' = c_s'' + (2/r)c_s'$ is evaluated as:
+\begin{equation}
+  (\mathcal{L}\mathbf{c}_s)_i = (\tilde{\mathbf{D}}^{(2)}\mathbf{c}_s)_i + \frac{2}{\hat{r}_i R_s}(\tilde{\mathbf{D}}\mathbf{c}_s)_i, \quad i = 1,\ldots,N-2
+  \label{eq:spherical_lap}
+\end{equation}
+At $r=0$, L'Hôpital's rule gives $\mathcal{L}c_s|_{r=0} = 3 c_s''(0)$, which is enforced by replacing the interior formula at node $i=0$. At the surface node $i = N-1$, the flux boundary condition \cref{eq:bc_surface} replaces the PDE row.
+
+\subsection{Clenshaw--Curtis Quadrature}
+
+Integration over the particle (e.g., for volume-averaged concentration) uses Clenshaw--Curtis weights $w_i^{CC}$. For $N$ CGL nodes on $[0,1]$:
+\begin{align}
+  w_i^{CC} &= \frac{1}{N-1}\left[1 + \sum_{j=1}^{\lfloor(N-1)/2\rfloor} \frac{2}{1-4j^2}\cos\!\left(\frac{2\pi j i}{N-1}\right)\right], \quad i = 0, \ldots, N-1 \label{eq:cc_weights}\\
+  w_0, w_{N-1} &\leftarrow w_0/2, \; w_{N-1}/2 \quad\text{(endpoint halving)}
+\end{align}
+
+\section{Finite Volume Discretisation of Electrolyte Transport}
+\label{sec:fvm_electrolyte}
+
+\subsection{Cell-Centred Mesh}
+
+The through-cell domain $[0, L_n + L_s + L_p]$ is partitioned into $N_\text{el} = N_{x,n} + N_{x,s} + N_{x,p}$ cells. For a uniform mesh with $N$ cells in region of length $L$, the cell centres are at:
+\begin{equation}
+  x_i = \frac{L}{N}\left(i + \frac{1}{2}\right), \quad i = 0,\ldots,N-1
+  \label{eq:fvm_cell_centres}
+\end{equation}
+and face positions at $x_{i+1/2} = (i+1)L/N$.
+
+\subsection{Gradient and Divergence Operators}
+
+The gradient matrix $\mathbf{G} \in \mathbb{R}^{(N+1)\times N}$ maps cell-centre values to face-centre fluxes:
+\begin{equation}
+  G_{f,i} = \begin{cases} -1/(x_i - x_{i-1}) & \text{if face } f = i-1/2 \text{ is between cells } i-1, i \\ 0 & \text{otherwise} \end{cases}
+  \label{eq:fvm_G}
+\end{equation}
+with boundary rows set to zero (no-flux). The divergence matrix $\mathbf{D} \in \mathbb{R}^{N \times (N+1)}$:
+\begin{equation}
+  D_{i,f} = \begin{cases} -1/\Delta x_i & f = i - 1/2 \\ +1/\Delta x_i & f = i + 1/2 \\ 0 & \text{otherwise} \end{cases}
+  \label{eq:fvm_D}
+\end{equation}
+
+\subsection{Harmonic Mean Interface Diffusivity}
+
+At each interior face, the diffusivity is averaged harmonically to ensure flux conservation across material interfaces~\cite{Patankar1980}:
+\begin{equation}
+  D_\text{eff,face} = \frac{2 D_\text{eff,L} D_\text{eff,R}}{D_\text{eff,L} + D_\text{eff,R} + \epsilon}
+  \label{eq:harmonic_mean}
+\end{equation}
+where $\epsilon = 10^{-20}$ prevents division by zero. This is implemented in \texttt{FiniteVolumeOperators.harmonic\_mean()} and called via \texttt{face\_coefficients()}.
+
+\subsection{Assembled Electrolyte PDE}
+
+The semi-discrete form of \cref{eq:electrolyte_state} on the FVM mesh is:
+\begin{equation}
+  \ddt{\hat{\mathbf{c}}_e} = \mathbf{D}\left[\mathbf{D}_\text{face} \cdot \mathbf{G} \hat{\mathbf{c}}_e^*\right] + \mathbf{s}_e
+  \label{eq:fvm_semidiscrete}
+\end{equation}
+where $\hat{\mathbf{c}}_e^* = \hat{\mathbf{c}}_e / \boldsymbol{\varepsilon}_e$ is the physical concentration, $\mathbf{D}_\text{face}$ is the diagonal matrix of face diffusivities, and $\mathbf{s}_e$ is the source vector.
+
+\section{Implicit Backward Euler Newton Solver}
+\label{sec:newton_solver}
+
+\subsection{Backward Euler Discretisation}
+
+Let $\mathbf{y}(t) \in \mathbb{R}^{N_\text{state}}$ be the full state vector of a single cell. The semi-discrete ODE system is $\dot{\mathbf{y}} = \mathbf{f}(\mathbf{y}, t; \mathbf{p})$. The Backward Euler scheme gives the nonlinear residual at each timestep:
+\begin{equation}
+  \mathbf{R}(\mathbf{y}^{n+1}) = \mathbf{y}^{n+1} - \mathbf{y}^n - \Delta t \cdot \mathbf{f}(\mathbf{y}^{n+1}; \mathbf{p}) = \mathbf{0}
+  \label{eq:be_residual}
+\end{equation}
+
+\subsection{Newton--Raphson Iteration}
+
+Starting from an initial guess $\mathbf{y}^{n+1,(0)} = \mathbf{y}^n$ (or a thermal predictor, see below), the Newton correction at iteration $k$ is:
+\begin{equation}
+  \mathbf{J}^{(k)} \cdot \boldsymbol{\delta\mathbf{y}}^{(k)} = -\mathbf{R}(\mathbf{y}^{n+1,(k)})
+  \label{eq:newton_system}
+\end{equation}
+\begin{equation}
+  \mathbf{y}^{n+1,(k+1)} = \mathbf{y}^{n+1,(k)} + \alpha^{(k)} \boldsymbol{\delta\mathbf{y}}^{(k)}
+  \label{eq:newton_update}
+\end{equation}
+where $\mathbf{J}^{(k)} = \partial \mathbf{R}/\partial \mathbf{y}|_{\mathbf{y}^{(k)}}$ is the Jacobian and $\alpha^{(k)} \in (0,1]$ is a damping factor from the line search.
+
+\subsection{Jacobian Computation via Automatic Differentiation}
+
+The Jacobian is computed using reverse-mode automatic differentiation:
+\begin{equation}
+  \mathbf{J} = \texttt{torch.func.jacrev}(\mathbf{R}, \text{argnums}=0)(\mathbf{y}^{(k)})
+  \label{eq:ad_jacobian}
+\end{equation}
+This avoids hand-deriving the full $N_\text{state} \times N_\text{state}$ Jacobian, which is non-trivial for the coupled nonlinear system. A small regularisation term prevents ill-conditioning:
+\begin{equation}
+  \hat{\mathbf{J}} = \mathbf{J} + \epsilon_d \mathbf{I}, \quad \epsilon_d = 10^{-12}
+  \label{eq:jac_regularise}
+\end{equation}
+
+\subsection{Scaled Convergence Criterion}
+
+The Newton iteration is considered converged when the scaled infinity norm of the residual satisfies:
+\begin{equation}
+  \left\|\mathbf{R} \cdot \mathbf{S}^{-1}\right\|_\infty < \text{tol} = 10^{-6}
+  \label{eq:newton_conv}
+\end{equation}
+where $\mathbf{S} \in \mathbb{R}^{N_\text{state}}$ is the scale vector. Each state field has a characteristic scale: $S(\texttt{cs\_n}) = S(\texttt{cs\_p}) = 30000$~\si{\mol\per\meter\cubed}, $S(\texttt{electrolyte}) = 1000$~\si{\mol\per\meter\cubed}, $S(\texttt{Lsei}) = 10^{-8}$~m, $S(\texttt{temperature}) = 300$~K. Scaling ensures that all residual components are dimensionally comparable.
+
+\subsection{Line Search with Non-Negativity Enforcement}
+
+After computing the Newton step $\boldsymbol{\delta y}$, the damping factor $\alpha$ is reduced by backtracking to ensure:
+\begin{enumerate}
+  \item Non-negativity: $\mathbf{y}^{(k)} + \alpha \boldsymbol{\delta y} \geq 0$ for all state fields flagged \texttt{nonnegative=True}.
+  \item Sufficient decrease: $\|\mathbf{R}(\mathbf{y}^{(k)} + \alpha \boldsymbol{\delta y}) \cdot \mathbf{S}^{-1}\| < \|\mathbf{R}(\mathbf{y}^{(k)}) \cdot \mathbf{S}^{-1}\|$.
+\end{enumerate}
+Up to 5 backtracking halvings are performed ($\alpha \in \{1, 0.5, 0.25, 0.125, 0.0625\}$).
+
+\subsection{Thermal Predictor}
+
+To improve convergence, the Newton iteration is initialised with a first-order explicit predictor for temperature:
+\begin{equation}
+  T_k^{(0)} = T_k^n + \Delta t \left[\dot{T}_k(\mathbf{y}^n, I_k^n) + (Q_\text{cond}/C_\text{th})_k^n \right]
+  \label{eq:thermal_predictor}
+\end{equation}
+All other states are initialised to $\mathbf{y}^n$.
+
+\section{GPU Batching via \texttt{torch.vmap}}
+\label{sec:vmap}
+
+For a pack with $N_\text{cells}$ cells, the Newton residual and Jacobian must be evaluated for all cells simultaneously. Each cell has an independent state vector $\mathbf{y}_k \in \mathbb{R}^{N_\text{state}}$; the only inter-cell coupling enters through the thermal conduction term $\boldsymbol{G}\boldsymbol{T}$ (added after the per-cell derivatives) and the current distribution solver (called before).
+
+This block-diagonal structure means the per-cell Jacobian $\mathbf{J}_k \in \mathbb{R}^{N_\text{state}\times N_\text{state}}$ can be evaluated in parallel across all cells using:
+\begin{equation}
+  [\mathbf{J}_1, \mathbf{J}_2, \ldots, \mathbf{J}_{N_\text{cells}}] = \texttt{vmap}(\texttt{jacrev}(\mathbf{R}_\text{cell}))(\mathbf{Y}, \mathbf{I}, \boldsymbol{\theta}, \mathbf{Y}^n, \Delta t)
+  \label{eq:vmap_jacobian}
+\end{equation}
+where $\mathbf{Y} \in \mathbb{R}^{N_\text{cells} \times N_\text{state}}$ is the batched state, $\mathbf{I} \in \mathbb{R}^{N_\text{cells}}$ is the per-cell current, and $\boldsymbol{\theta}$ is the batched parameter tensor. The linear solve is then:
+\begin{equation}
+  [\boldsymbol{\delta y}_1, \ldots, \boldsymbol{\delta y}_{N_\text{cells}}] = \texttt{torch.linalg.solve}(\hat{\mathbf{J}}, -\mathbf{R})
+  \label{eq:batched_solve}
+\end{equation}
+where batched LU factorisation is used by CUDA cuBLAS under the hood.
+
+\section{Adaptive Timestepping (LTE Control)}
+\label{sec:adaptive_dt}
+
+The \texttt{AdvancedSolver} employs Richardson extrapolation to estimate the local truncation error (LTE) at each step.
+
+\subsection{Step Doubling}
+
+Two independent estimates of $\mathbf{y}(t + \Delta t)$ are computed:
+\begin{align}
+  \mathbf{y}_1 &= \text{Newton}(\mathbf{y}^n, \Delta t) \quad\text{(one full step)} \label{eq:step_full}\\
+  \mathbf{y}_2 &= \text{Newton}(\text{Newton}(\mathbf{y}^n, \Delta t/2), \Delta t/2) \quad\text{(two half steps)} \label{eq:step_double}
+\end{align}
+
+\subsection{Error Estimate}
+
+The normalised LTE is:
+\begin{equation}
+  E = \max_i \frac{|\mathbf{y}_{2,i} - \mathbf{y}_{1,i}|}{a_\text{tol} S_i + r_\text{tol} |\mathbf{y}_{2,i}|}
+  \label{eq:lte}
+\end{equation}
+with $a_\text{tol} = 10^{-5}$ and $r_\text{tol} = 10^{-3}$.
+
+\subsection{PID Step-Size Controller}
+
+The next timestep is computed using an I-controller (safety-scaled square-root rule):
+\begin{equation}
+  \Delta t^{n+1} = \Delta t^n \cdot \min\!\left(2.0,\; \max\!\left(0.2,\; \frac{0.9}{(E + \epsilon)^{0.5}}\right)\right)
+  \label{eq:pid_dt}
+\end{equation}
+subject to $\Delta t \in [\Delta t_\text{min}, \Delta t_\text{max}] = [10^{-5}, 150]$~s.

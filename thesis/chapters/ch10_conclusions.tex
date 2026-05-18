@@ -1,0 +1,72 @@
+%% ============================================================
+%%  CHAPTER 10 — CONCLUSIONS AND FUTURE WORK
+%% ============================================================
+\chapter{Conclusions and Future Work}
+\label{ch:conclusion}
+
+\section{Summary of Contributions}
+
+This thesis has presented the \VIBE{} framework---a modular, GPU-accelerated software system for coupled electrochemical--thermal--degradation simulation of large-scale heterogeneous battery packs. The work addressed seven identified gaps in the existing literature and delivered the following verified contributions:
+
+\begin{enumerate}
+  \item \textbf{Symbolic PDE Framework.} A frozen-dataclass AST with operator overloading enables PDEs to be declared in natural mathematical notation (e.g., \texttt{-Div(D*Grad(c)) + Source}) and automatically compiled to discretised tensor operations. Three backends---FDM, FVM, and Chebyshev spectral collocation---are interchangeable at runtime, enabling the first systematic discretisation comparison study within a single battery simulation framework.
+
+  \item \textbf{Chebyshev Solid Diffusion.} Barycentric Chebyshev differentiation matrices and Clenshaw--Curtis quadrature are derived and implemented for solid particle diffusion in spherical coordinates. This achieves spectral convergence with 10 nodes per particle---comparable to FDM with $>50$ nodes---while correctly handling the $r=0$ singularity via L'Hôpital's rule.
+
+  \item \textbf{FVM Electrolyte Transport.} A conservative cell-centred FVM with harmonic-mean interface diffusivities handles the piecewise-constant Bruggeman-corrected diffusivity without artificial diffusion at electrode/separator interfaces.
+
+  \item \textbf{Conductance-Weighted Pack Current Solver.} A 5-iteration Kirchhoff network solver incorporating nonlinear Butler--Volmer dynamic resistance computes accurate per-cell currents in heterogeneous packs without linearisation of the electrochemical kinetics.
+
+  \item \textbf{Thermal Interconnection Matrix.} A systematic graph-Laplacian-based cell-to-cell thermal conductance matrix is constructed for arbitrary $N_s \times N_p$ pack topologies, enabling pack-level thermal equilibration dynamics to be integrated with the per-cell electrochemical ODEs.
+
+  \item \textbf{Plug-and-Play Degradation Library.} Seven SEI growth mechanisms, three lithium plating models, and two mechanical stress models are implemented in a unified registry API. All models operate on identical electrochemical driving forces, enabling the first systematic multi-mechanism SEI comparison study in a full DFN framework.
+
+  \item \textbf{GPU-Batched Implicit Newton Solver.} The full coupled system is solved via backward-Euler Newton iteration with \texttt{torch.func.jacrev} Jacobians batched across all cells via \texttt{torch.vmap}. This achieves near-linear GPU scaling with pack size and eliminates the need for hand-coded Jacobian derivations.
+\end{enumerate}
+
+\section{Answers to Research Questions}
+
+\begin{description}
+  \item[RQ1: Can DFN-fidelity pack simulation be made computationally feasible beyond small cell counts?]
+  Yes. The block-diagonal Jacobian structure, GPU batching, and implicit timestepping allow the framework to simulate 25-cell (5S5P) packs with full DFN physics within minutes on a modern GPU.
+
+  \item[RQ2: Does pack heterogeneity create self-reinforcing degradation feedback?]
+  Yes. The 5S5P heterogeneity study showed that a single branch with $10\times$ lower cooling and $20$--$30\%$ higher contact resistance accumulates $\approx 2\times$ more SEI thickness after 100 cycles compared to nominal branches, driven by the thermal-electrochemical coupling.
+
+  \item[RQ3: Do different SEI mechanisms produce quantifiably different degradation trajectories?]
+  Yes. The seven SEI models span a $>10\times$ range in capacity fade rate under identical conditions. The tunnelling model is most aggressive at early cycles; the solvent-diffusion model produces the characteristic parabolic $L_\text{SEI}(t)$ growth; reaction-limited growth is most temperature-sensitive.
+
+  \item[RQ4: Does physics-based evaluation change the assessment of BMS strategies?]
+  Yes. Because the thermal heterogeneity persists even with perfect voltage balancing, BMS strategies evaluated against ECM simulations may over-estimate their effectiveness. Active liquid cooling provides $>2\times$ better temperature uniformity than passive balancing alone.
+\end{description}
+
+\section{Limitations}
+
+\begin{itemize}
+  \item The solid diffusion model assumes spherical particles with uniform radius---particle size distribution effects are not modelled.
+  \item The electrolyte model uses dilute-solution theory; concentrated-solution effects (activity correction) are approximated via the empirical conductivity and diffusivity correlations.
+  \item Mechanical cracking is modelled via a smooth crack-flag; a proper fracture-mechanics model with crack opening displacement would be more rigorous.
+  \item The thermal model is lumped (single temperature per cell); distributed temperature fields within a cell would require 2D/3D heat equation.
+  \item The current distribution solver assumes ideal Kirchhoff topology; contact resistance asymmetry between current collectors is not modelled.
+\end{itemize}
+
+\section{Future Work}
+\label{sec:future_work}
+
+\begin{enumerate}
+  \item \textbf{Crack Mechanics Model.} Implement a proper fracture mechanics submodel with crack-opening displacement and fatigue crack growth, extending the SEI mismatch stress model to predict crack density as a state variable.
+
+  \item \textbf{CFD Coolant Coupling.} Replace the 1D coolant propagation model (\cref{eq:coolant_propagation}) with a 3D CFD-resolved coolant field, enabling spatial non-uniformity of cooling within a module.
+
+  \item \textbf{Machine Learning Surrogates.} Train physics-informed neural networks (PINNs) or Gaussian process surrogates on VIBE simulation data to create real-time-capable BMS models that inherit the physical fidelity of the framework.
+
+  \item \textbf{Digital Twin Integration.} Connect the framework to real-time sensor data (current, voltage, temperature) via a Kalman filter or unscented transform to maintain a live electrochemical state estimate for pack management.
+
+  \item \textbf{Solid-Electrolyte Interface Film Mechanics.} Model the mechanical response of the SEI film explicitly using thin-film elasticity, rather than the current mismatch-stress approximation.
+
+  \item \textbf{Multi-Scale Electrolyte.} Extend the electrolyte model to concentrated solution theory with full thermodynamic activity coefficient correction, enabling higher accuracy at high C-rates and low temperatures.
+
+  \item \textbf{Parameter Identification.} Implement a physics-informed parameter estimation pipeline to fit the DFN parameters to experimental charge--discharge curves using gradient-based optimisation through the differentiable simulator.
+
+  \item \textbf{Real-Time BMS Hardware Deployment.} Port the reduced-order surrogate to embedded hardware (FPGA or dedicated neuromorphic chip) for sub-millisecond BMS control loop execution.
+\end{enumerate}

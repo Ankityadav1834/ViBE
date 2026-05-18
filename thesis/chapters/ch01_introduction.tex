@@ -1,0 +1,131 @@
+%% ============================================================
+%%  CHAPTER 1 — INTRODUCTION
+%% ============================================================
+\chapter{Introduction}
+\label{ch:intro}
+
+\section{Motivation and Background}
+\label{sec:motivation}
+
+The global transition towards electrified transportation and grid-level energy storage has placed lithium-ion battery technology at the centre of modern engineering research. Electric vehicles (EVs), stationary storage systems, and consumer electronics collectively account for demand that is projected to exceed 2,000~\si{\giga\watt\hour} annually by 2030~\cite{IEA2023}. Ensuring the safety, reliability, and longevity of these systems requires a quantitative, physics-based understanding of the electrochemical, thermal, and mechanical processes occurring within and between individual battery cells.
+
+A modern lithium-ion battery pack is a deeply heterogeneous system. Even when manufactured with nominally identical cells, small differences in production tolerances, contact resistance at bus bars, thermal positioning within the pack enclosure, and the evolution of the Solid Electrolyte Interphase (SEI) layer over successive charge--discharge cycles combine to produce significant spread in cell-level state-of-charge (SOC), temperature, and state-of-health (SOH). This heterogeneity cascades: a hotter cell ages faster, its increased internal resistance forces neighbouring cells to carry a greater share of the pack current, further accelerating the thermal imbalance---a self-reinforcing feedback that ultimately governs pack lifetime~\cite{Gogoana2014,Baumhofer2014}.
+
+Understanding this feedback demands models that simultaneously resolve:
+\begin{enumerate}[noitemsep]
+  \item the micro-scale electrochemical kinetics within solid electrode particles (nanometre to micrometre);
+  \item the mesoscale electrolyte transport across electrode and separator layers (micrometre to millimetre);
+  \item the cell-level thermal dynamics (centimetre scale);
+  \item the pack-level current sharing and thermal conduction between cells (decimetre to metre scale).
+\end{enumerate}
+
+The Doyle--Fuller--Newman (DFN) model~\cite{Doyle1993,Fuller1994} achieves fidelity at the cell level by solving coupled PDEs for solid and electrolyte phase concentrations and potentials. However, the stiffness of these equations---arising from the wide separation of diffusive timescales between the solid particle (characteristic time $R_s^2/D_s \sim 10^3$~s) and the electrolyte (characteristic time $L^2/D_\text{eff} \sim 10$~s)---makes direct pack-level DFN simulation computationally prohibitive without specialised numerical methods.
+
+\subsection{The Computational Challenge}
+\label{ssec:comp_challenge}
+
+The typical DFN model for a single cell involves $O(100)$ coupled unknowns per time step and a dense Jacobian. Extending this naively to a $N_\text{s} \times N_\text{p}$ pack of $N_\text{cells} = N_\text{s} \cdot N_\text{p}$ cells produces a system of size $O(100 N_\text{cells})$, with cross-cell coupling through both the electrical network and the thermal conduction matrix. The Jacobian of the full coupled system scales as $O(N_\text{cells}^2)$ in the worst case, making direct dense methods infeasible beyond a few dozen cells.
+
+Contemporary literature reports that:
+\begin{itemize}[noitemsep]
+  \item DFN simulations of even 12-cell packs are described as computationally intensive~\cite{Kim2011};
+  \item Most pack-level electrochemical studies are restricted to series strings of 4--10 cells~\cite{Legrand2014};
+  \item Pack-level degradation studies almost universally employ reduced-order models such as the Single Particle Model (SPM) or equivalent-circuit models (ECM)~\cite{Zhang2020,Plett2004}.
+\end{itemize}
+
+The present work demonstrates that these computational barriers can be overcome through:
+\begin{itemize}[noitemsep]
+  \item a \emph{block-diagonal} Jacobian structure, exploiting the independence of per-cell physics;
+  \item GPU-batched automatic differentiation via \texttt{torch.vmap} and \texttt{torch.func.jacrev};
+  \item an implicit Backward Euler solver with scaled Newton iteration and line search.
+\end{itemize}
+
+\section{Literature Gap and Research Motivation}
+\label{sec:literature_gap}
+
+\Cref{tab:pack_comparison} summarises representative pack-level battery simulation studies from the literature. The pattern is striking: no existing open framework simultaneously provides DFN-level electrochemical fidelity, coupled thermal modelling, mechanistic degradation, large-scale parallelism, and modular software extensibility in a single integrated tool.
+
+\begin{table}[H]
+\centering
+\caption{Comparison of representative battery pack simulation frameworks in the literature.}
+\label{tab:pack_comparison}
+\small
+\begin{tabularx}{\textwidth}{p{3.0cm}ccccccc}
+\toprule
+\textbf{Framework / Study} & \textbf{Max Cells} & \textbf{Thermal} & \textbf{Degradation} & \textbf{Electrochem.} & \textbf{GPU} & \textbf{Balancing} \\
+\midrule
+Doyle et al.\ \cite{Doyle1993}      & 1   & No  & No  & DFN  & No  & No \\
+Kim et al.\ \cite{Kim2011}          & 12  & Yes & No  & DFN  & No  & No \\
+Legrand et al.\ \cite{Legrand2014}  & 6   & No  & No  & SPMe & No  & No \\
+PyBaMM \cite{Sulzer2021}            & 1   & Yes & Yes & DFN  & No  & No \\
+Zhang et al.\ \cite{Zhang2020}      & 100 & Yes & ECM & ECM  & No  & No \\
+Gogoana et al.\ \cite{Gogoana2014}  & 25  & No  & Est & ECM  & No  & No \\
+\textbf{\VIBE{} (this work)}        & \textbf{400+} & \textbf{Yes} & \textbf{Yes} & \textbf{DFN} & \textbf{Yes} & \textbf{Yes} \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\section{Objectives of this Thesis}
+\label{sec:objectives}
+
+The primary objective of this thesis is the design, implementation, and validation of a modular, GPU-accelerated software framework for coupled electrochemical--thermal--degradation simulation of large-scale heterogeneous lithium-ion battery packs. The specific research objectives are:
+
+\begin{enumerate}
+  \item \textbf{Develop a generalised symbolic PDE framework} with runtime-selectable spatial discretisation (FDM, FVM, Chebyshev spectral collocation) and operator-based PDE assembly, enabling arbitrary new physics to be added without modifying the solver core.
+
+  \item \textbf{Derive and implement a full DFN-class electrochemical model} for an $N_\text{s} \times N_\text{p}$ heterogeneous battery pack, including solid diffusion in spherical coordinates, nonlinear electrolyte transport with concentration-dependent diffusivity, Butler--Volmer kinetics with temperature-corrected exchange current density, concentration overpotential, and ohmic losses.
+
+  \item \textbf{Implement a modular degradation physics library} covering seven SEI growth mechanisms, three lithium plating models, and two mechanical stress models, all operating within the same state-vector and solver pipeline.
+
+  \item \textbf{Construct a pack-level current distribution algorithm} based on a nonlinear Kirchhoff network with Butler--Volmer dynamic resistance, capable of handling heterogeneous cell parameters and resolving current redistribution in real time.
+
+  \item \textbf{Develop physics-based battery management modules} for passive and active cell balancing (capacitor and inductor topologies) and three thermal management strategies (ambient convection, active liquid cooling, and phase-change material), evaluated against full electrochemical physics.
+
+  \item \textbf{Demonstrate computational scaling and physical fidelity} through quantitative validation experiments including single-cell comparison with PyBaMM, pack heterogeneity propagation, SEI model comparison, and degradation-aware balancing.
+\end{enumerate}
+
+\section{Thesis Contributions}
+\label{sec:contributions}
+
+The original contributions of this thesis are as follows:
+
+\begin{description}
+  \item[C1 --- Modular Symbolic PDE Engine.] A frozen-dataclass AST representation of PDEs with operator overloading, enabling human-readable PDE declaration (e.g., $\partial_t c = \nabla \cdot (D \nabla c)$) that is automatically compiled to discretised tensor operations. Three numerical backends (FDM, FVM, Chebyshev) are implemented and interchangeable.
+
+  \item[C2 --- Chebyshev--Gauss--Lobatto Discretisation of Spherical Solid Diffusion.] Barycentric Chebyshev differentiation matrices for solid particle diffusion are derived and implemented, with Clenshaw--Curtis quadrature for surface-averaged flux coupling. This avoids the artificial singularity handling required in FDM approaches and achieves spectral accuracy.
+
+  \item[C3 --- Harmonic-Mean Finite Volume Electrolyte Transport.] The electrolyte concentration PDE is discretised using a conservative cell-centred finite volume scheme with harmonic-mean interface diffusivities, ensuring correct flux continuity across electrode/separator interfaces without artificial diffusion.
+
+  \item[C4 --- Conductance-Weighted Iterative Current Distribution.] A Newton-linearised Kirchhoff network solver is developed that accounts for nonlinear Butler--Volmer dynamic resistance in current distribution. Unlike Thévenin-equivalent methods, this correctly captures the impedance of each cell at the operating point.
+
+  \item[C5 --- Physics-Coupled Thermal Interconnection Matrix.] A systematic cell-to-cell thermal conductance matrix $\boldsymbol{G}$ is derived for arbitrary $N_\text{s} \times N_\text{p}$ pack topologies, coupled to a lumped thermal model with pluggable cooling strategies.
+
+  \item[C6 --- Plug-and-Play Degradation Model Registry.] A unified API for SEI, plating, and stress models enables comparison of seven mechanistically distinct SEI formulations within a single simulation framework, using identical electrochemical driving forces.
+
+  \item[C7 --- GPU-Batched Implicit Newton Solver with Automatic Differentiation.] The full coupled PDE system is solved using backward-Euler Newton iterations where the Jacobian is computed via reverse-mode automatic differentiation (\texttt{jacrev}) and batched across all cells in parallel using \texttt{vmap}, achieving near-linear GPU scaling with pack size.
+\end{description}
+
+\section{Thesis Organisation}
+\label{sec:organisation}
+
+The remainder of this thesis is organised as follows:
+
+\begin{description}[leftmargin=2em]
+  \item[Chapter~\ref{ch:literature}] reviews the literature on electrochemical battery models, numerical methods for battery simulation, degradation physics, and pack-level studies.
+
+  \item[Chapter~\ref{ch:math_model}] derives the complete mathematical model: solid diffusion, electrolyte transport, Butler--Volmer kinetics, OCP parameterisation, thermal model, and the pack-level electrical network.
+
+  \item[Chapter~\ref{ch:numerics}] presents the numerical methods: Chebyshev collocation, finite volume discretisation, the Newton--Raphson solver, Jacobian scaling, adaptive timestepping, and GPU batching.
+
+  \item[Chapter~\ref{ch:software}] describes the software architecture: the symbolic PDE AST, operator pipeline, state layout registry, and the modular physics API.
+
+  \item[Chapter~\ref{ch:degradation}] details the degradation physics: SEI growth mechanisms, lithium plating, mechanical stress, and crack-enhanced SEI formation.
+
+  \item[Chapter~\ref{ch:pack}] presents the pack-level simulation framework: current distribution, thermal interconnection, and heterogeneity modelling.
+
+  \item[Chapter~\ref{ch:control}] covers battery management: balancing strategies and thermal management modules.
+
+  \item[Chapter~\ref{ch:results}] presents validation and simulation results.
+
+  \item[Chapter~\ref{ch:conclusion}] concludes the thesis and outlines future research directions.
+\end{description}

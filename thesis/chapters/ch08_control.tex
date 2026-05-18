@@ -1,0 +1,172 @@
+%% ============================================================
+%%  CHAPTER 8 — BATTERY MANAGEMENT AND CONTROL
+%% ============================================================
+\chapter{Battery Management and Control}
+\label{ch:control}
+
+\section{Overview}
+
+The \VIBE{} framework integrates battery management system (BMS) algorithms directly with DFN-level physics, enabling evaluation of balancing and thermal control strategies against full electrochemical simulation. This is in contrast to the standard practice in the BMS literature, where algorithms are evaluated against ECM or SPM simulations.
+
+\section{Controller Architecture}
+\label{sec:controller_arch}
+
+All controllers inherit from \texttt{BaseController} and implement two methods:
+\begin{itemize}
+  \item \texttt{compute\_current(t, y, solver, dt)} $\to$ \textit{pack current} [\si{\ampere}]
+  \item \texttt{should\_stop(t, y, voltages, current)} $\to$ \textit{(bool, message)}
+\end{itemize}
+
+The \texttt{ControlledSolver} calls these at each timestep:
+\begin{lstlisting}[language=Python, caption={Control loop integration}]
+while t < t_end:
+    I_pack = controller.compute_current(t, battery.y, battery, dt)
+    I_cells = battery.compute_effective_cell_currents(battery.y, I_pack)
+    y_new, success = newton_step(battery.y, dt, I_cells)
+    battery.y = y_new
+    stop, msg = controller.should_stop(t, battery.y, voltages, I_pack)
+\end{lstlisting}
+
+\section{Current Control Strategies}
+\label{sec:current_control}
+
+\subsection{Constant Current (CC)}
+
+The simplest strategy; applies a fixed pack current:
+\begin{equation}
+  I_\text{pack}(t) = I_\text{CC} = \text{const.}
+  \label{eq:cc_control}
+\end{equation}
+Terminates when any cell voltage exceeds $V_\text{max} = 4.2$~V or drops below $V_\text{min} = 2.5$~V.
+
+\subsection{Constant Current -- Constant Voltage (CC-CV)}
+
+Standard charging protocol:
+\begin{enumerate}
+  \item \textbf{CC phase}: Apply $I_\text{CC}$ until $\max_k V_k \geq V_\text{CV}$.
+  \item \textbf{CV phase}: Regulate current via proportional control on OCV error:
+\end{enumerate}
+\begin{equation}
+  I_\text{CV}(t) = -k_P \max(0,\; V_\text{CV} - \max_k V_k^{OCV}(t))
+  \label{eq:cv_control}
+\end{equation}
+where $k_P = 40$~\si{\ampere\per\volt}. The OCV-based error $V_\text{CV} - V^{OCV}$ (not terminal voltage) is used to avoid oscillation induced by the ohmic drop~\cite{Plett2004}. Charging terminates when $|I_\text{CV}| \leq I_\text{cut}$.
+
+\subsection{Cyclic CC-CV}
+
+The \texttt{CycleController} chains repeated charge--discharge cycles:
+\begin{enumerate}
+  \item CC-CV charge to $V_\text{CV} = 4.2$~V with $I_\text{cut} = 0.05 I_\text{CC}$.
+  \item CC discharge at $I_\text{dis}$ until $\min_k V_k \leq V_\text{min} = 2.5$~V.
+  \item Repeat for $N_\text{cycles}$ cycles.
+\end{enumerate}
+
+\subsection{Model Predictive Control (MPC)}
+
+The \texttt{MPCBatteryController} uses the \texttt{do-mpc} library~\cite{Frison2020} to solve a discrete-time optimal control problem over a horizon of $N_H = 12$ steps ($\Delta t = 5$~s), minimising SEI growth while maximising charged SOC:
+\begin{equation}
+  \min_{I_0,\ldots,I_{N_H-1}} -s_{N_H} + \sum_{k=0}^{N_H-1}\left[10^9 L_{k} + 0.5(T_k - T_\text{ref})^2 + 10^{-2} I_k^2\right]
+  \label{eq:mpc_cost}
+\end{equation}
+subject to the reduced-order dynamics (SOC, $T$, $L_\text{SEI}$ ODE), temperature constraint $T \leq T_\text{lim} = 313.15$~K, and current bounds $0 \leq I \leq I_\text{max}$.
+
+\section{Cell Balancing Modules}
+\label{sec:balancing}
+
+Balancing modules adjust per-cell currents to reduce voltage imbalance. All modules are called via \texttt{compute\_effective\_cell\_currents()} = (Kirchhoff distribution) + (balancing correction).
+
+\subsection{Passive (Bleed Resistor) Balancing}
+
+Passive balancing dissipates excess energy in shunt resistors when a cell is overcharged. The balancing current for cell $(s,p)$ is:
+\begin{equation}
+  I_\text{bal,k} = \frac{\text{softplus}[(V_k - V_\text{th}) \cdot 50]/50}{R_\text{bleed}} \cdot \sigma(-I_\text{str,k} \cdot 1000)
+  \label{eq:passive_bal}
+\end{equation}
+where the \texttt{softplus} provides a differentiable approximation of $\max(0, V_k - V_\text{th})$, the $\sigma(\cdot)$ factor activates balancing only during charging, and $R_\text{bleed} = 10~\Omega$ is the bleed resistance. This adds a positive (discharge) current to cells above $V_\text{th} = 4.0$~V.
+
+\subsection{Active Capacitor Balancing}
+
+Charge is transferred between adjacent cells in a series string using switched capacitors. The net current transferred from cell $p$ to cell $p+1$:
+\begin{equation}
+  I_\text{transfer} = \frac{V_p - V_{p+1}}{R_\text{eq}}, \quad R_\text{eq} = 0.5~\Omega
+  \label{eq:active_cap_bal}
+\end{equation}
+This reduces the voltage of the higher-voltage cell and charges the lower-voltage cell simultaneously.
+
+\subsection{Active Inductor Balancing}
+
+The inductor topology allows bidirectional transfer from any cell to any other in the string. The balancing current is proportional to the deviation from the string mean:
+\begin{equation}
+  I_\text{bal,k} = g_\text{bal}(\bar{V}_s - V_k), \quad \bar{V}_s = \frac{1}{N_p}\sum_{p=1}^{N_p} V_{s,p}
+  \label{eq:active_ind_bal}
+\end{equation}
+where $g_\text{bal} = 2.0$~\si{\ampere\per\volt}. This drives all cells towards the mean voltage of their parallel group.
+
+\section{Thermal Management Modules}
+\label{sec:thermal_mgmt}
+
+\subsection{Ambient Convection (Default)}
+
+The standard thermal boundary condition with inter-cell conduction:
+\begin{equation}
+  \ddt{\boldsymbol{T}} = \frac{\boldsymbol{Q}_\text{gen} + \boldsymbol{Q}_\text{cond} - h_\text{amb}(\boldsymbol{T} - T_\text{amb})}{\boldsymbol{C}_\text{th}}
+  \label{eq:ambient_thermal}
+\end{equation}
+
+\subsection{Active Liquid Cooling}
+
+A flowing coolant with inlet temperature $T_\text{in}$ and flow rate $\dot{m}c_p$ passes along the pack in the series direction. For each parallel branch $p$, the coolant temperature evolves:
+\begin{equation}
+  T_\text{fluid}(s, p) = T_\text{fluid}(s-1, p) + \varepsilon (T_{s,p} - T_\text{fluid}(s-1, p))
+  \label{eq:coolant_propagation}
+\end{equation}
+where $\varepsilon = 1 - e^{-hA_c/\dot{m}c_p}$ is the heat exchanger effectiveness. The per-cell cooling rate:
+\begin{equation}
+  Q_\text{cool,k} = hA_c (T_k - T_\text{fluid,k})
+  \label{eq:liquid_cool}
+\end{equation}
+
+\subsection{Phase Change Material (PCM) Cooling}
+
+A PCM layer surrounding the pack absorbs latent heat during melting. The effective thermal capacity is modified by the melting peak:
+\begin{equation}
+  C_\text{eff,k} = C_\text{th,k} + h_\text{latent} \cdot \delta_\epsilon(T_k - T_\text{melt})
+  \label{eq:pcm_capacity}
+\end{equation}
+where $\delta_\epsilon$ is a smoothed Dirac delta approximating the latent heat release:
+\begin{equation}
+  \delta_\epsilon(x) = \frac{1}{\epsilon\sqrt{\pi}} \exp\!\left(-\frac{x^2}{\epsilon^2}\right), \quad \epsilon = 1.5~\text{K}
+  \label{eq:smoothed_delta}
+\end{equation}
+The thermal ODE becomes:
+\begin{equation}
+  C_\text{eff,k} \ddt{T_k} = Q_\text{gen,k} - h_\text{amb}(T_k - T_\text{amb}) + (Q_\text{cond})_k
+  \label{eq:pcm_thermal_ode}
+\end{equation}
+
+\section{Comparison of BMS Strategies}
+\label{sec:bms_comparison}
+
+\Cref{tab:bms_strategy_comparison} provides a structured comparison of the BMS strategies available in \VIBE{}, including the physical basis and the key tradeoffs.
+
+\begin{table}[H]
+\centering
+\caption{Comparison of available battery management strategies.}
+\label{tab:bms_strategy_comparison}
+\small
+\begin{tabular}{p{3.0cm}p{3.0cm}p{3.2cm}p{3.5cm}}
+\toprule
+\textbf{Strategy} & \textbf{Type} & \textbf{Strengths} & \textbf{Limitations} \\
+\midrule
+No balancing & Baseline & No additional loss & Drift accumulates \\
+Passive bleed & Voltage-based & Simple, reliable & Energy wasteful; heating \\
+Active capacitor & Voltage-based & Low loss & Only adjacent cells \\
+Active inductor & Voltage-based & Pack-wide transfer & Complex switching \\
+MPC charging & Degradation-aware & Minimises SEI, $\Delta T$ & Requires reduced model \\
+\midrule
+Ambient convection & Passive cooling & Simplest & Limited at high C-rates \\
+Liquid cooling & Active & Low temperature rise & Complexity, pump power \\
+PCM & Passive & High thermal buffering & Finite latent heat \\
+\bottomrule
+\end{tabular}
+\end{table}

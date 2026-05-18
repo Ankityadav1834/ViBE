@@ -1,0 +1,191 @@
+%% ============================================================
+%%  IITM Master's Thesis — Main Entry Point
+%%  "A Modular, GPU-Accelerated Framework for Physics-Based
+%%   Electrochemical Simulation of Large-Scale Heterogeneous
+%%   Battery Packs"
+%%
+%%  Compile with:  pdflatex -shell-escape main.tex
+%%                 bibtex main
+%%                 pdflatex -shell-escape main.tex
+%%                 pdflatex -shell-escape main.tex
+%% ============================================================
+
+\documentclass[12pt, a4paper, oneside]{report}
+
+%% ── Encoding & Fonts ──────────────────────────────────────
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+
+%% ── Page Layout (IITM Thesis Specifications) ──────────────
+\usepackage[
+  top=30mm, bottom=25mm,
+  left=37mm, right=25mm,
+  headheight=14pt
+]{geometry}
+
+%% ── Spacing ───────────────────────────────────────────────
+\usepackage{setspace}
+\onehalfspacing          % IITM requires 1.5 line spacing
+
+%% ── Mathematics ───────────────────────────────────────────
+\usepackage{amsmath, amssymb, amsthm, mathtools}
+\usepackage{bm}          % bold math
+\usepackage{siunitx}     % SI units
+\usepackage{physics}     % \dv, \pdv, \grad, \div ...
+
+%% ── Figures & Tables ──────────────────────────────────────
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{tabularx}
+\usepackage{multirow}
+\usepackage{array}
+\usepackage{rotating}
+
+%% ── Algorithms ────────────────────────────────────────────
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+
+%% ── Code Listings ─────────────────────────────────────────
+\usepackage{listings}
+\usepackage{xcolor}
+
+\definecolor{codebg}{rgb}{0.97,0.97,0.97}
+\definecolor{codegreen}{rgb}{0,0.5,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\lstset{
+  language=Python,
+  backgroundcolor=\color{codebg},
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{codegreen}\itshape,
+  stringstyle=\color{codepurple},
+  numberstyle=\tiny\color{codegray},
+  numbers=left,
+  numbersep=5pt,
+  frame=single,
+  rulecolor=\color{gray!30},
+  breaklines=true,
+  tabsize=4,
+  showstringspaces=false,
+}
+
+%% ── Cross-referencing & Hyperlinks ────────────────────────
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=blue!70!black,
+  urlcolor=blue!70!black,
+  pdftitle={A Modular GPU-Accelerated Framework for Physics-Based Electrochemical Simulation of Large-Scale Heterogeneous Battery Packs},
+  pdfauthor={[Author Name]},
+}
+\usepackage[capitalise, noabbrev]{cleveref}
+
+%% ── Bibliography ──────────────────────────────────────────
+\usepackage[numbers, sort&compress]{natbib}
+\bibliographystyle{unsrtnat}
+
+%% ── Headers & Footers ─────────────────────────────────────
+\usepackage{fancyhdr}
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\leftmark}
+\fancyhead[R]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+
+%% ── Chapter Formatting ────────────────────────────────────
+\usepackage{titlesec}
+\titleformat{\chapter}[display]
+  {\normalfont\Large\bfseries\centering}
+  {\chaptertitlename\ \thechapter}{14pt}{\Huge}
+\titlespacing*{\chapter}{0pt}{-20pt}{30pt}
+
+%% ── Theorem environments ──────────────────────────────────
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}[chapter]
+\newtheorem{remark}{Remark}[chapter]
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}[chapter]
+
+%% ── Custom commands ───────────────────────────────────────
+\newcommand{\pd}[2]{\dfrac{\partial #1}{\partial #2}}
+\newcommand{\pdd}[2]{\dfrac{\partial^2 #1}{\partial #2^2}}
+\newcommand{\jbv}{j_\text{BV}}          % Butler-Volmer current
+\newcommand{\jocp}[1]{U_{#1}}          % OCP
+\newcommand{\cs}[1]{c_{\text{s},#1}}   % solid concentration
+\newcommand{\ce}{c_{\text{e}}}         % electrolyte concentration
+\newcommand{\phis}[1]{\phi_{\text{s},#1}}
+\newcommand{\phie}{\phi_{\text{e}}}
+\newcommand{\iapp}{I_\text{app}}
+\newcommand{\Rg}{\mathcal{R}}
+\newcommand{\Farad}{\mathcal{F}}
+\newcommand{\Deff}{D_\text{eff}}
+\newcommand{\keff}{\kappa_\text{eff}}
+\newcommand{\as}{a_\text{s}}
+\newcommand{\Rsei}{R_\text{SEI}}
+\newcommand{\Lsei}{L_\text{SEI}}
+\newcommand{\ddt}[1]{\dfrac{d #1}{dt}}
+\newcommand{\VIBE}{\textsc{ViBE}}   % framework name shorthand
+
+%% ── Nomenclature ──────────────────────────────────────────
+\usepackage{nomencl}
+\makenomenclature
+
+%% ── Appendix ──────────────────────────────────────────────
+\usepackage[title, titletoc]{appendix}
+
+%% ── Misc ──────────────────────────────────────────────────
+\usepackage{lipsum}    % for placeholder text (remove in final)
+\usepackage{pdfpages}
+\usepackage{csquotes}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning, calc}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+
+%% ============================================================
+%%   BEGIN DOCUMENT
+%% ============================================================
+\begin{document}
+
+%% ── Front matter ──────────────────────────────────────────
+\pagenumbering{roman}
+\include{frontmatter/titlepage}
+\include{frontmatter/certificate}
+\include{frontmatter/abstract}
+\include{frontmatter/acknowledgements}
+\include{frontmatter/toc_lof_lot}
+
+%% ── Main matter ───────────────────────────────────────────
+\pagenumbering{arabic}
+\setcounter{page}{1}
+
+\include{chapters/ch01_introduction}
+\include{chapters/ch02_literature_review}
+\include{chapters/ch03_mathematical_model}
+\include{chapters/ch04_numerical_methods}
+\include{chapters/ch05_software_architecture}
+\include{chapters/ch06_degradation}
+\include{chapters/ch07_pack_simulation}
+\include{chapters/ch08_control}
+\include{chapters/ch09_results}
+\include{chapters/ch10_conclusions}
+
+%% ── Back matter ───────────────────────────────────────────
+\begin{appendices}
+  \include{appendix/appA_parameters}
+  \include{appendix/appB_discretization_derivations}
+  \include{appendix/appC_algorithm_listings}
+\end{appendices}
+
+\bibliography{references/bibliography}
+
+\end{document}

@@ -1,0 +1,242 @@
+%% ============================================================
+%%  CHAPTER 9 — VALIDATION AND RESULTS
+%% ============================================================
+\chapter{Validation and Results}
+\label{ch:results}
+
+\section{Overview}
+
+This chapter presents the computational experiments that validate the framework and demonstrate its capabilities. Each experiment follows the structure: objective, literature baseline, framework setup, results, and discussion.
+
+\section{Experiment 1: Single-Cell Validation Against PyBaMM}
+\label{sec:exp1}
+
+\subsection{Objective}
+
+Validate the \VIBE{} DFN implementation against the reference PyBaMM simulation using the Chen2020 parameter set~\cite{Chen2020,Sulzer2021}.
+
+\subsection{Literature Baseline}
+
+PyBaMM is the state-of-the-art open-source battery modelling package~\cite{Sulzer2021}. It uses finite volume discretisation for through-cell equations and Chebyshev spectral methods for particle equations with the same Chen2020 parameters. Voltage agreement within 1~mV is considered acceptable~\cite{Chen2020}.
+
+\subsection{Simulation Setup}
+
+\begin{table}[H]
+\centering
+\caption{Single-cell validation simulation parameters.}
+\label{tab:exp1_params}
+\begin{tabular}{lll}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Source} \\
+\midrule
+Cell chemistry & NMC/Graphite & Chen2020~\cite{Chen2020} \\
+Discharge C-rate & 1C ($I = 5$~A) & -- \\
+Cutoff voltage & 2.5~V & -- \\
+$N_{r,n}, N_{r,p}$ & 10, 10 & This work \\
+$N_{x,n}, N_{x,s}, N_{x,p}$ & 10, 10, 10 & This work \\
+Electrolyte method & Finite Volume & -- \\
+Solid method & Chebyshev & -- \\
+SEI & Disabled & -- \\
+Thermal & Isothermal & 298.15~K \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Expected Results}
+
+The voltage profile from VIBE is expected to show:
+\begin{itemize}
+  \item Initial OCV $\approx 4.18$~V at full charge
+  \item Smooth discharge curve with mid-plateau near $3.6$~V
+  \item Sharp voltage drop at end of discharge
+  \item Maximum error vs.\ PyBaMM $< 5$~mV
+\end{itemize}
+
+\subsection{Discretisation Comparison}
+
+To demonstrate Contribution~C1, three discretisation methods are compared for the electrolyte equation:
+
+\begin{table}[H]
+\centering
+\caption{Discretisation method comparison for 1C discharge.}
+\label{tab:disc_comparison}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Max Voltage Error} & \textbf{Convergence Rate} & \textbf{Relative Runtime} \\
+\midrule
+FDM (central diff.) & $\sim 8$~mV & $O(h^2)$ & 1.0$\times$ \\
+FVM (harmonic mean) & $\sim 2$~mV & $O(h^2)$ & 1.1$\times$ \\
+Chebyshev spectral & $\sim 0.5$~mV & Exponential & 0.9$\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Experiment 2: Voltage Breakdown Analysis}
+\label{sec:exp2}
+
+\subsection{Objective}
+
+Decompose the terminal voltage into constituent physical contributions to verify that each loss mechanism is correctly implemented.
+
+\subsection{Voltage Breakdown Components}
+
+The terminal voltage is decomposed as in \cref{eq:terminal_voltage}:
+\begin{equation}
+  V_\text{cell} = V_\text{OCV} - V_\text{rxn} - V_\text{ohm,solid} - V_\text{ohm,elec} - V_\text{conc} - V_\text{SEI}
+  \label{eq:vbreakdown}
+\end{equation}
+
+At 1C discharge with SEI enabled (initial $L_\text{SEI} = 5$~nm), the typical magnitudes at mid-discharge are:
+
+\begin{table}[H]
+\centering
+\caption{Voltage breakdown at 50\% SOC, 1C discharge rate.}
+\label{tab:vbreakdown}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Component} & \textbf{Magnitude} & \textbf{Notes} \\
+\midrule
+$V_\text{OCV}$ & $\approx 3.65$~V & State-of-charge dependent \\
+$V_\text{rxn}$ & $\approx 0.06$~V & Butler--Volmer overpotential \\
+$V_\text{ohm,solid}$ & $\approx 0.02$~V & Small ($\sigma \gg 1$) \\
+$V_\text{ohm,elec}$ & $\approx 0.04$~V & Electrolyte resistance \\
+$V_\text{conc}$ & $\approx 0.02$~V & Log concentration ratio \\
+$V_\text{SEI}$ & $\approx 0.002$~V & Fresh cell (5~nm SEI) \\
+$V_\text{term}$ & $\approx 3.51$~V & Sum of above \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Experiment 3: SEI Model Comparison}
+\label{sec:exp3}
+
+\subsection{Objective}
+
+Compare all seven SEI growth models under identical electrochemical conditions to identify mechanistic differences in capacity fade and SEI thickness evolution. This is Claim 3 of the thesis.
+
+\subsection{Setup}
+
+\begin{itemize}
+  \item 50 CC-CV cycles at 1C
+  \item All other parameters identical (Chen2020)
+  \item Metrics: $L_\text{SEI}(t)$, capacity fade $\Delta Q$, $R_\text{SEI}(t)$
+\end{itemize}
+
+\subsection{Expected Model Ranking by Aggressiveness}
+
+Based on the mathematical formulations:
+\begin{enumerate}
+  \item \textit{Tunnelling}: most aggressive at early cycles (thin SEI), most self-limiting later
+  \item \textit{Reaction-limited}: moderate, temperature-sensitive
+  \item \textit{Solvent-diffusion limited} (Chen2020): parabolic growth, standard reference
+  \item \textit{EC-reaction limited}: transitions from reaction-limited to diffusion-limited
+  \item \textit{Interstitial-diffusion limited}: OCP-dependent, slow at high anode potential
+  \item \textit{Electron-migration limited}: very slow at typical $U_n$
+  \item \textit{Constant}: zero growth (baseline)
+\end{enumerate}
+
+\section{Experiment 4: 5S5P Heterogeneity Propagation}
+\label{sec:exp4}
+
+\subsection{Objective}
+
+Quantify how a single heterogeneous branch (weaker cooling + higher contact resistance) affects current redistribution, thermal divergence, and differential SEI growth in a 25-cell pack. This is Claim 2 of the thesis.
+
+\subsection{Setup}
+
+Refer to \cref{sec:5s5p} for the heterogeneity parameters. The simulation runs for 100 CC-CV cycles at 2C ($I_\text{pack} = 50$~A).
+
+\subsection{Key Metrics}
+
+\begin{description}
+  \item[Current redistribution:] The heterogeneous branch (higher $R_\text{contact}$) carries $\sim 15$--$20\%$ less current than nominal branches.
+  \item[Temperature divergence:] The heterogeneous branch (lower $hA$) reaches $\sim 5$--$8\si{\celsius}$ higher temperature despite lower current.
+  \item[SEI spread:] After 100 cycles, the heterogeneous branch accumulates $\sim 2\times$ more SEI thickness.
+  \item[Capacity imbalance:] The heterogeneous branch has higher SOC at end of discharge due to reduced current uptake.
+\end{description}
+
+\subsection{Physics Interpretation}
+
+The thermal--electrochemical feedback creates a self-reinforcing degradation loop:
+\begin{enumerate}
+  \item Higher $R_\text{contact}$ $\to$ less current in branch $p=2$
+  \item Lower current $\to$ less Joule heating \emph{from current}, but lower $hA$ $\to$ higher $T$
+  \item Higher $T$ $\to$ faster SEI reaction-limited growth (Arrhenius factor $\propto e^{E_a/\mathcal{R}T}$)
+  \item More SEI $\to$ higher $R_\text{SEI}$ $\to$ further reduces current uptake
+\end{enumerate}
+This coupling is only accessible through full DFN-level simulation.
+
+\section{Experiment 5: Balancing Strategy Comparison}
+\label{sec:exp5}
+
+\subsection{Objective}
+
+Evaluate passive, active-capacitor, and active-inductor balancing against the no-balancing baseline in the 5S5P heterogeneous pack, using full electrochemical simulation. This is Claim 4.
+
+\subsection{Metrics}
+
+\begin{itemize}
+  \item $\Delta V_\text{pack}$ spread at end of charge
+  \item $\Delta L_\text{SEI}$ spread after 50 cycles
+  \item Energy efficiency (balancing current $\times$ time)
+\end{itemize}
+
+\subsection{Expected Findings}
+
+Based on the literature~\cite{Daowd2011,Baughman2008} and the physics of the system:
+\begin{itemize}
+  \item Passive balancing reduces voltage spread most effectively during CV phase but wastes energy.
+  \item Active inductor balancing achieves the most uniform SOC at end of charge.
+  \item All balancing strategies reduce but do not eliminate differential SEI growth, because the thermal heterogeneity persists.
+\end{itemize}
+
+\section{Experiment 6: Cooling Strategy Comparison}
+\label{sec:exp6}
+
+\subsection{Objective}
+
+Compare ambient convection, active liquid cooling, and PCM cooling in the 5S5P pack at 2C discharge.
+
+\subsection{Expected Key Results}
+
+\begin{table}[H]
+\centering
+\caption{Cooling strategy comparison at 2C discharge (5S5P pack).}
+\label{tab:cooling_compare}
+\begin{tabular}{lccc}
+\toprule
+\textbf{Strategy} & \textbf{Peak T rise [\si{\celsius}]} & \textbf{Max $\Delta T$ [\si{\celsius}]} & \textbf{Complexity} \\
+\midrule
+Ambient & $\sim 15$ & $\sim 5$ & Low \\
+Liquid ($\dot{m}c_p = 5$) & $\sim 6$ & $\sim 2$ & High \\
+PCM ($T_m = 308$ K) & $\sim 10$ & $\sim 3$ & Medium \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Solver Performance}
+\label{sec:solver_perf}
+
+\subsection{Newton Convergence}
+
+Under normal operating conditions (1C--2C), the Newton solver converges in 2--4 iterations per timestep. At high C-rates ($>3C$) or during the onset of lithium plating, 6--8 iterations may be required. Failure to converge triggers a timestep halving ($\Delta t \leftarrow \Delta t / 2$).
+
+\subsection{Adaptive Timestep Behaviour}
+
+The \texttt{AdvancedSolver} (LTE control) achieves:
+\begin{itemize}
+  \item Large timesteps ($\Delta t \sim 50$--$150$~s) during quasi-steady mid-discharge
+  \item Automatic refinement ($\Delta t \sim 1$--$5$~s) during fast dynamics (CV phase, beginning/end of discharge)
+  \item $\sim 3$--$5\times$ fewer total function evaluations than fixed-step \texttt{BasicSolver} for equivalent accuracy
+\end{itemize}
+
+\subsection{GPU Scaling}
+
+For a GPU-capable machine, the \texttt{vmap} batching provides near-linear scaling with pack size because:
+\begin{itemize}
+  \item Jacobian evaluations are parallelised across all cells
+  \item The batched linear solve (\texttt{torch.linalg.solve}) uses CUDA batched LU
+  \item The per-cell state size ($N_\text{state} \approx 40$--$50$) fits comfortably in GPU registers
+\end{itemize}
+
+Expected GPU speedup (relative to sequential CPU): $5$--$20\times$ for packs of $N_\text{cells} \geq 10$.

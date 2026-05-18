@@ -1,11 +1,12 @@
 from main import ImplicitBatterySolver
 from controllers import build_controller
+from pde_sim.output.output_spec import OutputSpec
 
 # Configuration for the battery pack
 config = {
-    'device': 'cpu',   # 'auto' = use GPU if available, or set 'cpu' / 'cuda' explicitly
-    'n_series': 2,      # Number of cells in series
-    'n_parallel': 2,   # Number of cells in parallel
+    'device': 'cuda',   # 'auto' = use GPU if available, or set 'cpu' / 'cuda' explicitly
+    'n_series': 10,      # Number of cells in series
+    'n_parallel': 10,   # Number of cells in parallel
     'electrolyte_spatial_method': 'finite_volume',  # 'finite_volume', 'finite_difference', or 'chebyshev'
     'solid_spatial_method': 'chebyshev',            # Particle PDEs currently use spherical Chebyshev operators.
     'stress_options': {
@@ -17,7 +18,7 @@ config = {
         'coupling': 1.0,       # Source strength from electrolyte concentration deviation
         'force_area': 0.1027   # Area used for derived force_from_stress output
     },
-    'topology': 'series_first' # 'parallel_first' (P-S blocks) or 'series_first' (S-P strings)
+    'topology': 'series_first'
 }
 
 # Controller settings
@@ -40,18 +41,18 @@ controller_config = {
         'target_c_rate': 2.0
     },
     'cycle_cccv': {
-        'cc_current': -10.0,         # Charging current (A)
+        'cc_current': -100.0,         # Charging current (A)
         'cv_voltage': 4.2,          # CV voltage (V)
         'cutoff_current': 1.0,      # Cutoff current for CV (A)
-        'discharge_current': 10.0,  # Discharge current (A)
+        'discharge_current': 100.0,  # Discharge current (A)
         'min_voltage': 2.4,         # Discharge cutoff voltage (V)
         'max_voltage': 4.4,         # Charge cutoff voltage (V)
-        'n_cycles': 2          # Number of cycles
+        'n_cycles': 200          # Number of cycles
     }
 }
 
 solver_method = 'advanced'   # 'basic' or 'advanced'
-pack_current = 10.0
+pack_current = 50.0
 
 # Discretization parameters
 discretization = {
@@ -64,7 +65,7 @@ discretization = {
 }
 
 # Parameter overrides (if any)
-overrides = {(0,1): {'hA': 0.531}}  # e.g., {(0,0): {'T_amb': 308.15}} for cell 0,0
+overrides = {(0,1): {'hA': 0.531}, (1,0): {'hA': 0.531}, (2,0): {'hA': 0.531}, (3,0): {'hA': 0.531}, (4,0): {'hA': 0.531}}  # e.g., {(0,0): {'T_amb': 308.15}} for cell 0,0
 
 # Initial state selection
 initial_state_mode = 'fully_charged'   # 'fully_charged' or 'fully_discharged'
@@ -116,9 +117,9 @@ battery_solver = ImplicitBatterySolver(
 Simulation mode selection
 Set use_controller = True and controller_strategy = 'cycle_cccv' to enable cycling mode.
 """
-use_controller = False
+use_controller = True
 controller_strategy = 'cycle_cccv'   # 'constant_current', 'current_profile', 'cc_cv', 'mpc', 'cycle_cccv'
-controller_dt_max = 50.0
+controller_dt_max = 200.0
 
 if use_controller:
     controller = build_controller(controller_strategy, **controller_config[controller_strategy])
@@ -135,3 +136,5 @@ else:
         I_pack=pack_current,
         method=solver_method
     )
+
+output_spec = OutputSpec(["default", "capacity_fade"])

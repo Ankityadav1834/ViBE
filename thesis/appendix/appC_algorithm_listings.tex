@@ -1,0 +1,132 @@
+%% ============================================================
+%%  APPENDIX C — ALGORITHM LISTINGS
+%% ============================================================
+\chapter{Key Algorithm Listings}
+\label{app:algorithms}
+
+\section{Per-Cell Derivative Computation}
+
+\begin{lstlisting}[language=Python, caption={Core per-cell electrochemistry evaluation (simplified from \texttt{electrochemistry.py})}]
+def compute_derivatives_functional(physics, y_flat, I_app, p, y_old=None, dt=None):
+    # Unpack state
+    cs_n = physics.state(y_flat, 'cs_n')
+    cs_p = physics.state(y_flat, 'cs_p')
+    ce_eps = physics.state(y_flat, 'electrolyte')
+    T_cell = physics.state(y_flat, 'temperature')
+    Lsei   = physics.state(y_flat, 'Lsei')
+
+    # Arrhenius correction
+    arr_n = exp(E_r_n/R_g * (1/T_ref - 1/T_cell))
+    arr_p = exp(E_r_p/R_g * (1/T_ref - 1/T_cell))
+
+    # OCP
+    theta_n = cs_n[-1] / cs_max_n
+    theta_p = cs_p[-1] / cs_max_p
+    Un, Up  = OCP_n(theta_n), OCP_p(theta_p)
+    OCV     = Up - Un
+
+    # Exchange current density (with sqrt(ce) weighting)
+    j0_n = m_ref_n * arr_n * sum(sqrt(ce_n) * W_n) * sqrt(cs_n[-1]*(cs_max_n - cs_n[-1]))
+    j0_p = m_ref_p * arr_p * sum(sqrt(ce_p) * W_p) * sqrt(cs_p[-1]*(cs_max_p - cs_p[-1]))
+
+    # Butler-Volmer (arcsinh form)
+    i_n = I_app / (as_n * A * Ln)
+    i_p = -I_app / (as_p * A * Lp)
+    eta_n = (2*R_g*T_cell/F) * arcsinh(i_n / (2*j0_n))
+    eta_p = (2*R_g*T_cell/F) * arcsinh(i_p / (2*j0_p))
+
+    # Voltage losses
+    R_sei  = Lsei / (as_n * A * Ln * kappa_sei)
+    V_term = OCV - (eta_n - eta_p) - I_app*(R_solid + R_elec + R_sei) - V_conc
+
+    # Thermal model
+    Q_gen  = I_app * (OCV - V_term)
+    Q_cool = hA * (T_cell - T_amb)
+    dT_dt  = (Q_gen - Q_cool) / (rho_Cp * Vol_cell)
+
+    # SEI growth
+    j_sei   = sei_model(Lsei, i_n, Un, T_cell, p)
+    dLsei_dt = -(Vbar_sei/(F*z_sei)) * j_sei
+
+    # Assemble and return packed derivative vector
+    return pack(dcs_n=..., dcs_p=..., dce=..., dLsei=dLsei_dt, dT=dT_dt)
+\end{lstlisting}
+
+\section{GPU-Batched Newton Step}
+
+\begin{lstlisting}[language=Python, caption={Batched Newton step using vmap and jacrev (simplified from \texttt{solver.py})}]
+def newton_step(y_curr, dt, I_app, tol=1e-6, max_iter=15):
+    y_next = thermal_predictor(y_curr, dt, I_app)  # Initial guess
+
+    def res_fn(y, i, p, y_old, dt):
+        dy = compute_derivatives_functional(y, i, p, y_old, dt)
+        return y - y_old - dt * dy
+
+    for k in range(max_iter):
+        dY = batched_derivatives(y_next, I_app, y_curr, dt)
+        R  = y_next - y_curr - dt * dY
+
+        # Check scaled convergence
+        if norm(R / scale, inf) < tol:
+            return y_next, True
+
+        # Automatic Jacobian via vmap(jacrev)
+        J = vmap(jacrev(res_fn, argnums=0), in_dims=(0,0,0,0,None))(
+            y_next, I_vec, params, y_curr, dt)
+        J += eye(N_state) * 1e-12  # Regularisation
+
+        delta_y = linalg.solve(J, -R)
+
+        # Line search with non-negativity
+        alpha = backtrack(y_next, delta_y, y_curr, dt, nonnegative_mask)
+        y_next = y_next + alpha * delta_y
+
+    return y_next, False
+\end{lstlisting}
+
+\section{Thermal Interconnection Matrix}
+
+\begin{lstlisting}[language=Python, caption={Thermal connection matrix for arbitrary $N_s \times N_p$ packs}]
+def _build_thermal_connection_matrix(n_series, n_parallel,
+                                     k_contact=0.5, area=0.005, dist=0.02):
+    n_cells = n_series * n_parallel
+    G = torch.zeros((n_cells, n_cells))
+    G_val = k_contact * area / dist  # [W/K]
+    for s in range(n_series):
+        for p in range(n_parallel):
+            k = s * n_parallel + p
+            if p < n_parallel - 1:        # same series row
+                G[k, k+1] = G[k+1, k] = G_val
+            if s < n_series - 1:          # adjacent series row
+                G[k, k+n_parallel] = G[k+n_parallel, k] = G_val
+    return G  # Graph Laplacian basis: L_G = G - diag(G @ 1)
+\end{lstlisting}
+
+\section{Adding a New PDE State}
+
+\begin{lstlisting}[language=Python, caption={Extending the framework with a new PDE (example: lithium deposition layer)}]
+# In model_registry.py — add to STATE_EQUATIONS dict:
+"n_Li": StateEquationSpec(
+    order=95,
+    size=1,
+    initial=0.0,
+    scale=1e-3,          # mol/m^2
+    nonnegative=True,
+    enabled=lambda config: config.get('plating_options', {}).get('enabled', False),
+    options_key="lithium_plating_options",
+    rhs=lambda physics, y, i, p, ctx: get_plating_model(
+        physics.plating_model_name)(
+        ctx['phi_s_n'], ctx['i_n'], physics.state(y,'temperature'), p, physics.device
+    ),
+    equation="dn_Li/dt = -i_plating / F",
+),
+\end{lstlisting}
+
+This single entry automatically:
+\begin{itemize}
+  \item Registers \texttt{n\_Li} as a new state in the flat vector
+  \item Sets initial condition, scaling, and non-negativity constraint
+  \item Evaluates the RHS using the plating model registry
+  \item Includes/excludes based on config flag
+\end{itemize}
+No modification to the solver, Jacobian computation, or timestepping is required.

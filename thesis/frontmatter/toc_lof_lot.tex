@@ -1,0 +1,113 @@
+%% ── Table of Contents, List of Figures, List of Tables ──
+\tableofcontents
+\newpage
+\listoffigures
+\addcontentsline{toc}{chapter}{List of Figures}
+\newpage
+\listoftables
+\addcontentsline{toc}{chapter}{List of Tables}
+\newpage
+
+%% ── List of Abbreviations ────────────────────────────────
+\chapter*{List of Abbreviations}
+\addcontentsline{toc}{chapter}{List of Abbreviations}
+\thispagestyle{plain}
+
+\begin{longtable}{p{3.5cm} p{11cm}}
+\toprule
+\textbf{Abbreviation} & \textbf{Full Form} \\
+\midrule
+BMS     & Battery Management System \\
+CC      & Constant Current \\
+CC-CV   & Constant Current -- Constant Voltage \\
+CFD     & Computational Fluid Dynamics \\
+DAE     & Differential Algebraic Equation \\
+DFN     & Doyle--Fuller--Newman \\
+DOF     & Degrees of Freedom \\
+ECM     & Equivalent Circuit Model \\
+EV      & Electric Vehicle \\
+FDM     & Finite Difference Method \\
+FVM     & Finite Volume Method \\
+GPU     & Graphics Processing Unit \\
+LTE     & Local Truncation Error \\
+MPC     & Model Predictive Control \\
+NMC     & Nickel Manganese Cobalt (oxide) \\
+OCP / OCV & Open Circuit Potential / Voltage \\
+PCM     & Phase Change Material \\
+PDE     & Partial Differential Equation \\
+SEI     & Solid Electrolyte Interphase \\
+SOC     & State of Charge \\
+SOH     & State of Health \\
+SPM     & Single Particle Model \\
+SPMe    & Single Particle Model with electrolyte \\
+VIBE    & Virtual Battery Environment (this framework) \\
+\bottomrule
+\end{longtable}
+
+\newpage
+
+%% ── List of Symbols ──────────────────────────────────────
+\chapter*{List of Symbols}
+\addcontentsline{toc}{chapter}{List of Symbols}
+\thispagestyle{plain}
+
+\begin{longtable}{p{3.5cm} p{9cm} p{2cm}}
+\toprule
+\textbf{Symbol} & \textbf{Description} & \textbf{Unit} \\
+\midrule
+$a_\text{s}$ & Specific interfacial surface area of electrode & \si{\per\meter} \\
+$A$ & Electrode cross-sectional area (geometric) & \si{\meter\squared} \\
+$c_\text{s}$ & Lithium concentration in solid electrode particle & \si{\mol\per\meter\cubed} \\
+$c_\text{s,max}$ & Maximum lithium concentration in solid phase & \si{\mol\per\meter\cubed} \\
+$c_\text{e}$ & Lithium-ion concentration in electrolyte & \si{\mol\per\meter\cubed} \\
+$c_\text{e,0}$ & Initial (reference) electrolyte concentration & \si{\mol\per\meter\cubed} \\
+$D_\text{s}$ & Solid-phase lithium diffusivity & \si{\meter\squared\per\second} \\
+$D_\text{eff}$ & Effective electrolyte diffusivity (Bruggeman corrected) & \si{\meter\squared\per\second} \\
+$E_\text{a}$ & Activation energy & \si{\joule\per\mol} \\
+$E_\text{g}$ & Young's modulus of graphite particle & \si{\pascal} \\
+$E_\text{SEI}$ & Young's modulus of SEI film & \si{\pascal} \\
+$\mathcal{F}$ & Faraday constant (\SI{96485.33}{\coulomb\per\mol}) & \si{\coulomb\per\mol} \\
+$G_{ij}$ & Thermal conductance between cells $i$ and $j$ & \si{\watt\per\kelvin} \\
+$\boldsymbol{G}$ & Thermal interconnection (conductance) matrix & \si{\watt\per\kelvin} \\
+$h$ & Heat transfer coefficient & \si{\watt\per\meter\squared\per\kelvin} \\
+$hA$ & Lumped convection coefficient & \si{\watt\per\kelvin} \\
+$I$ & Applied current (pack level) & \si{\ampere} \\
+$i$ & Current density & \si{\ampere\per\meter\squared} \\
+$j_0$ & Exchange current density & \si{\ampere\per\meter\squared} \\
+$j_\text{SEI}$ & SEI formation current density & \si{\ampere\per\meter\squared} \\
+$K_\text{Ic}$ & Mode-I fracture toughness & \si{\pascal\sqrt{\meter}} \\
+$\kappa$ & Electrolyte ionic conductivity & \si{\siemens\per\meter} \\
+$\kappa_\text{SEI}$ & SEI ionic conductivity & \si{\siemens\per\meter} \\
+$L$ & Electrode thickness & \si{\meter} \\
+$L_\text{SEI}$ & SEI layer thickness & \si{\meter} \\
+$m_\text{ref}$ & Reference exchange current density prefactor & \si{\ampere\per\meter^{3.5}} \\
+$M_\text{SEI}$ & Molar mass of SEI product & \si{\kilogram\per\mol} \\
+$\nu$ & Poisson's ratio & -- \\
+$\Omega$ & Partial molar volume of lithium in graphite & \si{\meter\cubed\per\mol} \\
+$\phi_\text{s}$ & Solid-phase electric potential & \si{\volt} \\
+$\phi_\text{e}$ & Electrolyte electric potential & \si{\volt} \\
+$Q_\text{gen}$ & Volumetric heat generation rate & \si{\watt} \\
+$Q_\text{cool}$ & Heat removal rate & \si{\watt} \\
+$r$ & Radial coordinate in spherical particle & \si{\meter} \\
+$R_\text{s}$ & Particle radius & \si{\meter} \\
+$\mathcal{R}$ & Universal gas constant (\SI{8.314}{\joule\per\mol\per\kelvin}) & \si{\joule\per\mol\per\kelvin} \\
+$R_\text{SEI}$ & SEI film resistance & \si{\ohm} \\
+$\rho$ & Density & \si{\kilogram\per\meter\cubed} \\
+$\rho C_\text{p}$ & Volumetric heat capacity & \si{\joule\per\meter\cubed\per\kelvin} \\
+$\sigma$ & Mechanical stress & \si{\pascal} \\
+$\sigma_\text{s}$ & Solid-phase electronic conductivity & \si{\siemens\per\meter} \\
+$T$ & Temperature & \si{\kelvin} \\
+$t_+$ & Lithium transference number & -- \\
+$U$ & Open circuit potential (OCP) & \si{\volt} \\
+$V$ & Terminal voltage & \si{\volt} \\
+$V_\text{pack}$ & Pack terminal voltage & \si{\volt} \\
+$V_\text{cell}$ & Cell volume & \si{\meter\cubed} \\
+$\eta$ & Electrochemical overpotential & \si{\volt} \\
+$\varepsilon$ & Volume fraction (porosity) & -- \\
+$\theta$ & Stoichiometry (dimensionless SOC) & -- \\
+\bottomrule
+\end{longtable}
+
+\textit{Subscripts:} $n$ = negative electrode (anode); $p$ = positive electrode (cathode); $s$ = separator; $\text{e}$ = electrolyte; $\text{ref}$ = reference state; $\text{amb}$ = ambient.
+
+\newpage

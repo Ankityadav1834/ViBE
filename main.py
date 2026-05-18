@@ -95,7 +95,7 @@ class BatteryPhysics(torch.nn.Module):
             'm_ref_n', 'm_ref_p', 'sigma_n', 'sigma_p', 
             'E_r_n', 'E_r_p', # Activation Energies
             'Vol_cell', 'rho_Cp', 'hA', 'T_amb' , 'eps_e_n' , 'eps_e_s' , 'eps_e_p',
-            'ce_0', 'Lsei_0'
+            'ce_0', 'Lsei_0', 'R_contact', 'R_bus'
         ]
         
         self.params = {}
@@ -467,7 +467,11 @@ class ImplicitBatterySolver:
         balancing_options=None,
         thermal_options=None
     ):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        _dev = config.get('device', 'auto')
+        if _dev == 'auto' or _dev is None:
+            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        else:
+            self.device = torch.device(_dev)   # 'cuda', 'cpu', 'cuda:0', etc.
         self.config, self.disc = config, discretization
         self.n_cells = config['n_series'] * config['n_parallel']
         self.n_series, self.n_parallel = config['n_series'], config['n_parallel']
@@ -650,24 +654,57 @@ class ImplicitBatterySolver:
             x.view(self.n_series, self.n_parallel)
             for x in self.physics.get_circuit_parameters(y)
         ]
-        I_grid = torch.full_like(OCV, I_pack_val / self.n_parallel)
+        
+        topology = self.config.get('topology', 'parallel_first')
         RTF = 8.314 * T / 96485.33
-        for _ in range(5):
-            Rd_n = (2 * RTF) / torch.sqrt(I_grid**2 + (2 * I0n)**2 + 1e-12)
-            Rd_p = (2 * RTF) / torch.sqrt(I_grid**2 + (2 * I0p)**2 + 1e-12)
-            R_total = R + Rd_n + Rd_p
-            V_curr = (
-                OCV
-                - I_grid * R
-                - 2 * RTF * torch.asinh(I_grid / (2 * I0n + 1e-12))
-                - 2 * RTF * torch.asinh(I_grid / (2 * I0p + 1e-12))
-                - Vc
-            )
-            V_virtual = V_curr + I_grid * R_total
-            G = 1.0 / R_total
-            V_term = (torch.sum(V_virtual * G, 1, True) - I_pack_val) / torch.sum(G, 1, True)
-            I_grid = (V_virtual - V_term) * G
-        return I_grid.view(self.n_cells, 1)
+        
+        if topology == 'parallel_first':
+            I_grid = torch.full_like(OCV, I_pack_val / self.n_parallel)
+            for _ in range(5):
+                Rd_n = (2 * RTF) / torch.sqrt(I_grid**2 + (2 * I0n)**2 + 1e-12)
+                Rd_p = (2 * RTF) / torch.sqrt(I_grid**2 + (2 * I0p)**2 + 1e-12)
+                R_total = R + Rd_n + Rd_p
+                V_curr = (
+                    OCV
+                    - I_grid * R
+                    - 2 * RTF * torch.asinh(I_grid / (2 * I0n + 1e-12))
+                    - 2 * RTF * torch.asinh(I_grid / (2 * I0p + 1e-12))
+                    - Vc
+                )
+                V_virtual = V_curr + I_grid * R_total
+                G = 1.0 / R_total
+                V_term = (torch.sum(V_virtual * G, 1, True) - I_pack_val) / torch.sum(G, 1, True)
+                I_grid = (V_virtual - V_term) * G
+            return I_grid.view(self.n_cells, 1)
+            
+        elif topology == 'series_first':
+            I_string = torch.full((1, self.n_parallel), I_pack_val / self.n_parallel, device=OCV.device, dtype=OCV.dtype)
+            for _ in range(5):
+                I_grid = I_string.expand(self.n_series, self.n_parallel)
+                Rd_n = (2 * RTF) / torch.sqrt(I_grid**2 + (2 * I0n)**2 + 1e-12)
+                Rd_p = (2 * RTF) / torch.sqrt(I_grid**2 + (2 * I0p)**2 + 1e-12)
+                R_total = R + Rd_n + Rd_p
+                V_curr = (
+                    OCV
+                    - I_grid * R
+                    - 2 * RTF * torch.asinh(I_grid / (2 * I0n + 1e-12))
+                    - 2 * RTF * torch.asinh(I_grid / (2 * I0p + 1e-12))
+                    - Vc
+                )
+                V_virtual = V_curr + I_grid * R_total
+                
+                R_string = torch.sum(R_total, 0, True)
+                V_string_virt = torch.sum(V_virtual, 0, True)
+                
+                G_string = 1.0 / R_string
+                V_pack = (torch.sum(V_string_virt * G_string, 1, True) - I_pack_val) / torch.sum(G_string, 1, True)
+                
+                I_string = (V_string_virt - V_pack) * G_string
+            
+            I_grid = I_string.expand(self.n_series, self.n_parallel)
+            return I_grid.reshape(self.n_cells, 1)
+        else:
+            raise ValueError(f"Unknown topology: {topology}")
 
     def compute_balancing_currents(self, y, I_pack_val):
         cell_voltages = self.get_exact_terminal_voltages(y, I_pack_val).view(self.n_series, self.n_parallel)
@@ -695,6 +732,20 @@ class ImplicitBatterySolver:
         heat_generation = self.compute_heat_generation(y, cell_currents)
         return self.thermal_module.compute_temperature_rhs(self, temperatures, heat_generation)
 
+    def compute_cell_to_cell_conduction(self, y):
+        """
+        Returns only the Gth inter-cell conduction term [K/s], without
+        heat generation or cooling strategy. Used when temperature_models.py
+        already handles per-cell Q_gen and Q_cool, so we only need to add
+        the pack-level spatial coupling between neighboring cells.
+
+            dT_cond/dt = (Gth @ T - diag(Gth)*T) / Cth
+        """
+        temperatures = y[:, -1:]
+        q_cond = self.Gth @ temperatures - torch.sum(self.Gth, dim=1, keepdim=True) * temperatures
+        return q_cond / (self.Cth + 1e-12)
+
+
     def get_exact_terminal_voltages(self, y_batch, I_pack_val):
         with torch.no_grad():
             if torch.is_tensor(I_pack_val):
@@ -717,7 +768,14 @@ class ImplicitBatterySolver:
             current_input = self.compute_effective_cell_currents(y, I_pack_val)
         cell_voltages = self.get_exact_terminal_voltages(y, current_input)
         voltage_grid = cell_voltages.view(self.n_series, self.n_parallel)
-        return torch.sum(torch.mean(voltage_grid, dim=1)).item()
+        
+        topology = self.config.get('topology', 'parallel_first')
+        if topology == 'parallel_first':
+            return torch.sum(torch.mean(voltage_grid, dim=1)).item()
+        elif topology == 'series_first':
+            return torch.mean(torch.sum(voltage_grid, dim=0)).item()
+        else:
+            raise ValueError(f"Unknown topology: {topology}")
 
     def check_voltage_limits(self, y, I_pack_val, min_voltage=None, max_voltage=None):
         min_voltage = self.min_cell_voltage if min_voltage is None else min_voltage
@@ -737,28 +795,45 @@ class ImplicitBatterySolver:
             return True, int(min_idx.item()), float(min_val.item()), "min"
         return False, None, None, None
 
-    def simulate(self, t_end, dt_init, I_pack=None, method='basic', controller=None, dt_max=None):
+    def simulate(self, t_end, dt_init, I_pack=None, method='basic', controller=None,
+                 dt_max=None, output_spec=None, run_name=None):
         import sys
         import os
-        
-        run_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
-        if not run_name or run_name == '-c': 
+        from pde_sim.output import OutputSpec
+
+        if not run_name:
+            run_name = os.path.splitext(os.path.basename(sys.argv[0]))[0]
+        if not run_name or run_name == '-c':
             run_name = 'default_run'
-            
+
         out_dir = os.path.join(os.getcwd(), 'simulation_result', run_name, 'results')
         os.makedirs(out_dir, exist_ok=True)
-        
+
+        # Use caller's spec or fall back to the default
+        spec = output_spec or OutputSpec("default")
+
         old_cwd = os.getcwd()
+        # Pin the project root so local modules (electrochemistry, etc.)
+        # remain importable after os.chdir moves into the output directory.
+        import sys as _sys
+        _project_root = old_cwd
+        if _project_root not in _sys.path:
+            _sys.path.insert(0, _project_root)
         os.chdir(out_dir)
         try:
             if controller is not None:
-                self.controlled_solver.simulate(t_end, dt_init, controller, dt_max=dt_max)
+                self.controlled_solver.simulate(
+                    t_end, dt_init, controller,
+                    dt_max=dt_max, out_dir=out_dir, output_spec=spec,
+                )
                 return
 
             if method == 'basic':
-                self.basic_solver.simulate(t_end, dt_init, I_pack)
+                self.basic_solver.simulate(t_end, dt_init, I_pack,
+                                           out_dir=out_dir, output_spec=spec)
             elif method == 'advanced':
-                self.advanced_solver.simulate(t_end, dt_init, I_pack)
+                self.advanced_solver.simulate(t_end, dt_init, I_pack,
+                                              out_dir=out_dir, output_spec=spec)
             else:
                 raise ValueError("Method must be 'basic' or 'advanced'")
         finally:
@@ -782,5 +857,11 @@ class ImplicitBatterySolver:
             'as_n': 3.83e5, 'as_p': 3.82e5, 'sigma_n': 215.0, 'sigma_p': 0.18, 'eps_e_n': 0.25, 'eps_e_s': 0.47, 'eps_e_p': 0.335,
             't_plus': 0.2594, 'ce_0': 1000.0, 'b': 1.5, 'm_ref_n': 6.48e-7, 'E_r_n': 35000, 'm_ref_p': 3.42e-6, 'E_r_p': 17800,
             'kappa_sei': 1/200000.0, 'Msei': 0.162, 'rho_sei': 1690.0, 'Us': 0.4, 'Lsei_0': 5e-9,
-            'Vol_cell': 2.42e-5, 'rho_Cp': 1.7676e6, 'hA': 0.0531, 'T_amb': 298.15
+            'Vol_cell': 2.42e-5, 'rho_Cp': 1.7676e6, 'hA': 0.0531, 'T_amb': 298.15,
+            # Resistance values matched to liionpack defaults (Tranter et al., 2022)
+            # Rc = 1e-2 Ω  (tab-to-busbar weld / interconnection)
+            # Rb = 1e-4 Ω  (busbar segment per cell)
+            # Rt = 1e-5 Ω  (terminal lug) — folded into R_bus for lumped model
+            'R_contact': 1e-2,   # Ω  — weld/contact resistance per cell
+            'R_bus':     1e-4,   # Ω  — busbar + terminal lumped per cell
         }

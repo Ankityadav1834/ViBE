@@ -1,0 +1,27 @@
+%% ── Abstract ─────────────────────────────────────────────
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+\thispagestyle{plain}
+
+Physics-based electrochemical simulation of lithium-ion battery packs requires resolving coupled, nonlinear partial differential equations across multiple spatial domains and temporal scales, ranging from sub-micron solid-diffusion within active electrode particles to pack-level thermal conduction across hundreds of cells. The computational cost of such models---particularly the Doyle--Fuller--Newman (DFN) class---has historically restricted rigorous electrochemical analysis to single-cell or small-pack configurations.
+
+This thesis presents \VIBE{} (\textbf{Vi}rtual \textbf{B}attery \textbf{E}nvironment), a modular, GPU-accelerated Python framework for high-fidelity, coupled electrochemical--thermal--degradation simulation of large-scale heterogeneous battery packs. The framework makes four principal research contributions:
+
+\begin{enumerate}[leftmargin=1.5em]
+  \item \textbf{Modular PDE Framework with Interchangeable Discretisations.} A symbolic expression abstract-syntax-tree (AST) is introduced, enabling any conservation-law PDE to be declared in natural mathematical notation and automatically discretised using Finite Difference (FDM), Finite Volume (FVM), or Chebyshev spectral collocation methods, selected independently per spatial domain at runtime.
+
+  \item \textbf{Large-Scale Pack Electrochemistry.} A generalised Kirchhoff-network current-distribution solver is coupled to per-cell DFN-level physics. The framework is shown to scale from 1-cell to 100-cell packs while preserving electrochemical fidelity. A conductance-weighted iterative update scheme resolves nonlinear Butler--Volmer impedance within each Newton sub-step.
+
+  \item \textbf{Coupled Degradation Modelling.} Seven mechanistically distinct SEI growth models (solvent-diffusion limited, reaction limited, interstitial-diffusion limited, EC-reaction limited, electron-migration limited, tunnelling, and a stress-enhanced built-in model) are implemented in a plug-and-play registry. These are coupled to a fracture-mechanics model for crack-enhanced SEI growth and to three lithium plating models (symmetric Butler--Volmer, irreversible, and Yang 2017 asymmetric), all operating within the same state-vector formalism.
+
+  \item \textbf{Physics-Informed Pack Management.} Passive bleed, active capacitor, and active inductor balancing strategies, together with ambient convection, active liquid cooling, and phase-change material (PCM) thermal management modules, are evaluated against fully coupled electrochemical physics---as opposed to the equivalent-circuit approximations used in most balancing studies.
+\end{enumerate}
+
+All governing equations are integrated via an implicit Backward-Euler Newton scheme, with automatic-differentiation Jacobians computed using \texttt{torch.func.jacrev} and batched across cells via \texttt{torch.vmap}, enabling GPU-parallel simulation of multi-string packs. An adaptive timestepping scheme based on Richardson extrapolation local-truncation-error (LTE) estimation is implemented for the advanced solver mode.
+
+Validation experiments demonstrate sub-millivolt agreement with PyBaMM reference solutions for single-cell discharge, and quantify the impact of heterogeneous contact resistance and cooling coefficients on current redistribution, temperature divergence, and differential SEI growth in a 5-series$\times$5-parallel pack configuration.
+
+\vspace{0.5em}
+\noindent\textbf{Keywords:} Lithium-ion battery; Doyle--Fuller--Newman model; Finite Volume Method; Chebyshev collocation; SEI growth; Lithium plating; Pack simulation; GPU acceleration; Battery management; Thermal heterogeneity.
+
+\newpage

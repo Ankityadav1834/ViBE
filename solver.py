@@ -4,9 +4,14 @@ import matplotlib.pyplot as plt
 import time
 import pandas as pd
 
+from pde_sim.output import OutputSpec, ResultsProcessor
+
+_DEFAULT_SPEC = OutputSpec("default")
+
 class BasicSolver:
-    def __init__(self, battery_solver):
+    def __init__(self, battery_solver, output_spec: OutputSpec | None = None):
         self.battery = battery_solver
+        self.output_spec = output_spec or _DEFAULT_SPEC
 
     def solve_current_distribution(self, y, I_pack_val):
         return self.battery.compute_effective_cell_currents(y, I_pack_val)
@@ -17,8 +22,13 @@ class BasicSolver:
     def thermal_predictor(self, y_curr, dt, I_app):
         y_pred = y_curr.clone()
         T_old = y_curr[:, -1:]
+        thermal_model = getattr(self.battery.physics, 'thermal_model_name', 'builtin')
+        if thermal_model == 'isothermal':
+            return y_pred  # T stays constant — no update
         dY = self.battery.physics.batched_derivatives(y_curr, I_app)
-        thermal_rhs = dY[:, -1:] + self.battery.compute_thermal_rhs(y_curr, I_app)
+        # dY[:,-1] already has per-cell Q_gen & Q_cool from electrochemistry.
+        # Add only Gth cell-to-cell conduction to avoid double-counting cooling.
+        thermal_rhs = dY[:, -1:] + self.battery.compute_cell_to_cell_conduction(y_curr)
         y_pred[:, -1:] = T_old + dt * thermal_rhs
         return y_pred
 
@@ -72,15 +82,26 @@ class BasicSolver:
         return y_next, False
 
     def apply_thermal_coupling(self, dY, Y, I_app):
-        dY[:, -1:] += self.battery.compute_thermal_rhs(Y, I_app)
+        thermal_model = getattr(self.battery.physics, 'thermal_model_name', 'builtin')
+        if thermal_model == 'isothermal':
+            pass  # no pack coupling: temperature must not change
+        elif thermal_model == 'builtin':
+            # builtin handles Q_gen+Q_cool internally; only add Gth cell-to-cell conduction
+            dY[:, -1:] += self.battery.compute_cell_to_cell_conduction(Y)
+        else:
+            # entropic etc: per-cell model handles Q_gen+Q_cool; add Gth conduction only
+            dY[:, -1:] += self.battery.compute_cell_to_cell_conduction(Y)
         return dY
 
-    def simulate(self, t_end, dt_init, I_pack):
+    def simulate(self, t_end, dt_init, I_pack, out_dir=".", output_spec=None):
+        if output_spec is not None:
+            self.output_spec = output_spec
         t, dt = 0.0, dt_init
         times, y_hist = [0.0], [self.battery.y.clone().cpu()]
         print(f"Starting Basic GPU Simulation on {self.battery.device} (Adaptive Time Step - No LTE)")
         start_time = time.time()
-        
+        self._out_dir = out_dir
+
         # Adaptive time stepping parameters (without LTE)
         dt_max = 50.0
         dt_min = 1e-5
@@ -124,7 +145,7 @@ class BasicSolver:
 
                     
         print(f"Complete in {time.time()-start_time:.2f}s")
-        self.process_results(times, y_hist, I_pack)
+        self.process_results(times, y_hist, I_pack, self._out_dir)
 
     def _get_voltage_breakdown_numpy(self, y_cell, I_cell, p):
         # Use PyTorch pipeline for exact results
@@ -167,73 +188,15 @@ class BasicSolver:
             "Conc": V_conc, "SEI": V_sei
         }
 
-    def process_results(self, times, y_list, I_pack):
-        self.battery.output_manager.save(times, y_list, I_pack, filename='all_results.csv')
-        print("Saved all_results.csv")
-
-        times = np.array(times)
-        y = torch.stack(y_list).numpy()
-        n_steps = len(times)
-        res = {k: np.zeros((n_steps, self.battery.n_cells)) for k in ['TermV', 'OCV', 'Rxn', 'OhmS', 'OhmE', 'Conc', 'SEI', 'Temp', 'Curr', 'SOC', 'SEI_Thick']}
-        res['PackVoltage'] = np.zeros(n_steps)
-        
-        with torch.no_grad():
-            for i in range(n_steps):
-                y_t = torch.from_numpy(y[i]).to(self.battery.device)
-                I_c_t = self.solve_current_distribution(y_t, I_pack)
-                I_c = I_c_t.cpu().numpy().flatten()
-                res['Curr'][i, :] = I_c
-                volts = []
-                for k in range(self.battery.n_cells):
-                    p = self.battery.raw_params[k]
-                    y_c = y[i, k]
-                    bd = self._get_voltage_breakdown_numpy(y_c, I_c[k], p)
-                    res['TermV'][i,k] = bd['TermV']
-                    res['OCV'][i,k] = bd['OCV']
-                    res['Rxn'][i,k] = bd['Rxn']
-                    res['OhmS'][i,k] = bd['OhmSolid']
-                    res['OhmE'][i,k] = bd['OhmElec']
-                    res['Conc'][i,k] = bd['Conc']
-                    res['SEI'][i,k] = bd['SEI']
-                    res['Temp'][i,k] = y_c[-1] # K
-                    res['SEI_Thick'][i,k] = y_c[-2] * 1e9 # nm
-                    res['SOC'][i,k] = (y_c[self.battery.physics.Nr_n-1]/p['cs_max_n'] - 0.01)/0.94
-                    volts.append(bd['TermV'])
-                res['PackVoltage'][i] = np.sum(np.mean(np.array(volts).reshape(self.battery.n_series, self.battery.n_parallel), axis=1))
-
-        fig, axes = plt.subplots(4, 2, figsize=(16, 20), constrained_layout=True)
-        t_h = times
-        axes[0,0].plot(t_h, res['PackVoltage'], 'k'); axes[0,0].set_title('Pack Voltage')
-        ax2 = axes[0,0].twinx(); ax2.plot(t_h, np.full_like(t_h, I_pack), 'r--'); ax2.set_ylabel('Pack Current [A]')
-        for k in range(self.battery.n_cells): axes[0,1].plot(t_h, res['TermV'][:,k], label=f'C{k}')
-        axes[0,1].legend(); axes[0,1].set_title('Cell Voltages')
-        for k in range(self.battery.n_cells): axes[1,0].plot(t_h, res['Curr'][:,k])
-        axes[1,0].set_title('Cell Currents [A]')
-        for k in range(self.battery.n_cells): axes[1,1].plot(t_h, res['Temp'][:,k] - 273.15)
-        axes[1,1].set_title('Temperature [C]')
-        for k in range(self.battery.n_cells): axes[2,0].plot(t_h, res['SEI_Thick'][:,k])
-        axes[2,0].set_title('SEI Thickness [nm]')
-        for k in range(self.battery.n_cells): axes[2,1].plot(t_h, res['SOC'][:,k])
-        axes[2,1].set_title('SOC')
-        
-        idx_b = 1 if self.battery.n_cells > 1 else 0
-        stk1 = [res['TermV'][:,idx_b], res['SEI'][:,idx_b], res['OhmS'][:,idx_b], res['OhmE'][:,idx_b], res['Conc'][:,idx_b], res['Rxn'][:,idx_b]]
-        axes[3,0].stackplot(t_h, stk1, labels=['V','SEI','OhmS','OhmE','Conc','Rxn'], alpha=0.6)
-        axes[3,0].plot(t_h, res['OCV'][:,idx_b], 'k--'); axes[3,0].set_title(f'Breakdown C{idx_b}'); axes[3,0].legend(loc='lower left')
-        
-        idx_a = 0
-        stk0 = [res['TermV'][:,idx_a], res['SEI'][:,idx_a], res['OhmS'][:,idx_a], res['OhmE'][:,idx_a], res['Conc'][:,idx_a], res['Rxn'][:,idx_a]]
-        axes[3,1].stackplot(t_h, stk0, labels=['V','SEI','OhmS','OhmE','Conc','Rxn'], alpha=0.6)
-        axes[3,1].plot(t_h, res['OCV'][:,idx_a], 'k--'); axes[3,1].set_title(f'Breakdown C{idx_a}'); axes[3,1].legend(loc='lower left')
-        
-        plt.show()
-        pd.DataFrame({'time': times, 'pack_voltage': res['PackVoltage']}).to_csv('voltage_vs_time.csv', index=False)
-        print("Saved voltage_vs_time.csv")
+    def process_results(self, times, y_list, I_pack, out_dir="."):
+        proc = ResultsProcessor(self.battery, self, self.output_spec, out_dir)
+        proc.run(times, y_list, I_pack)
 
 
 class AdvancedSolver:
-    def __init__(self, battery_solver):
+    def __init__(self, battery_solver, output_spec: OutputSpec | None = None):
         self.battery = battery_solver
+        self.output_spec = output_spec or _DEFAULT_SPEC
 
     def solve_current_distribution(self, y, I_pack_val):
         return self.battery.compute_effective_cell_currents(y, I_pack_val)
@@ -244,8 +207,13 @@ class AdvancedSolver:
     def thermal_predictor(self, y_curr, dt, I_app):
         y_pred = y_curr.clone()
         T_old = y_curr[:, -1:]
+        thermal_model = getattr(self.battery.physics, 'thermal_model_name', 'builtin')
+        if thermal_model == 'isothermal':
+            return y_pred  # T stays constant — no update
         dY = self.battery.physics.batched_derivatives(y_curr, I_app)
-        thermal_rhs = dY[:, -1:] + self.battery.compute_thermal_rhs(y_curr, I_app)
+        # dY[:,-1] already has per-cell Q_gen & Q_cool from electrochemistry.
+        # Add only Gth cell-to-cell conduction to avoid double-counting cooling.
+        thermal_rhs = dY[:, -1:] + self.battery.compute_cell_to_cell_conduction(y_curr)
         y_pred[:, -1:] = T_old + dt * thermal_rhs
         return y_pred
 
@@ -299,7 +267,12 @@ class AdvancedSolver:
         return y_next, False
 
     def apply_thermal_coupling(self, dY, Y, I_app):
-        dY[:, -1:] += self.battery.compute_thermal_rhs(Y, I_app)
+        thermal_model = getattr(self.battery.physics, 'thermal_model_name', 'builtin')
+        if thermal_model == 'isothermal':
+            pass  # no pack coupling: temperature must not change
+        else:
+            # For all models: only Gth conduction (Q_gen/Q_cool handled per-cell in electrochemistry)
+            dY[:, -1:] += self.battery.compute_cell_to_cell_conduction(Y)
         return dY
 
     def compute_step_lte(self, y_c, dt, I_pack_val, abstol=1e-5, reltol=1e-3):
@@ -335,7 +308,10 @@ class AdvancedSolver:
         # Return the HALF step result mathematically
         return y_half_2, error_norm, True
 
-    def simulate(self, t_end, dt_init, I_pack):
+    def simulate(self, t_end, dt_init, I_pack, out_dir=".", output_spec=None):
+        if output_spec is not None:
+            self.output_spec = output_spec
+        self._out_dir = out_dir
         t, dt = 0.0, dt_init
         times, y_hist = [0.0], [self.battery.y.clone().cpu()]
         print(f"Starting GPU Simulation on {self.battery.device} (Chebyshev Collocation w/ LTE PID Control)")
@@ -394,7 +370,7 @@ class AdvancedSolver:
                     break
                     
         print(f"Complete in {time.time()-start_time:.2f}s")
-        self.process_results(times, y_hist, I_pack)
+        self.process_results(times, y_hist, I_pack, self._out_dir)
 
     def _get_voltage_breakdown_numpy(self, y_cell, I_cell, p):
         Nr_n, Nr_p, Nel = self.battery.physics.Nr_n, self.battery.physics.Nr_p, self.battery.physics.Nel
@@ -436,84 +412,34 @@ class AdvancedSolver:
         
         ln_ce = np.log(np.maximum(ce_real, 1e-6))
         V_conc = term * (1.0-p['t_plus']) * (np.sum(ln_ce[:self.battery.physics.Nx_n]*W_n) - np.sum(ln_ce[-self.battery.physics.Nx_p:]*W_p))
-        V_term = OCV - V_rxn - V_ohm_solid - V_ohm_elec - V_conc - V_sei
+        V_term = OCV - V_rxn - V_ohm_solid - V_ohm_elec - V_conc - V_sei - I_cell * (p.get('R_contact', 0.0) + p.get('R_bus', 0.0))
         return {"TermV": V_term, "OCV": OCV, "Rxn": V_rxn, "OhmSolid": V_ohm_solid, "OhmElec": V_ohm_elec, "Conc": V_conc, "SEI": V_sei}
 
-    def process_results(self, times, y_list, I_pack):
-        self.battery.output_manager.save(times, y_list, I_pack, filename='all_results.csv')
-        print("Saved all_results.csv")
-
-        times = np.array(times)
-        y = torch.stack(y_list).numpy()
-        n_steps = len(times)
-        res = {k: np.zeros((n_steps, self.battery.n_cells)) for k in ['TermV', 'OCV', 'Rxn', 'OhmS', 'OhmE', 'Conc', 'SEI', 'Temp', 'Curr', 'SOC', 'SEI_Thick']}
-        res['PackVoltage'] = np.zeros(n_steps)
-        
-        with torch.no_grad():
-            for i in range(n_steps):
-                y_t = torch.from_numpy(y[i]).to(self.battery.device)
-                I_c_t = self.solve_current_distribution(y_t, I_pack)
-                I_c = I_c_t.cpu().numpy().flatten()
-                res['Curr'][i, :] = I_c
-                volts = []
-                for k in range(self.battery.n_cells):
-                    p = self.battery.raw_params[k]
-                    y_c = y[i, k]
-                    bd = self._get_voltage_breakdown_numpy(y_c, I_c[k], p)
-                    res['TermV'][i,k] = bd['TermV']
-                    res['OCV'][i,k] = bd['OCV']
-                    res['Rxn'][i,k] = bd['Rxn']
-                    res['OhmS'][i,k] = bd['OhmSolid']
-                    res['OhmE'][i,k] = bd['OhmElec']
-                    res['Conc'][i,k] = bd['Conc']
-                    res['SEI'][i,k] = bd['SEI']
-                    res['Temp'][i,k] = y_c[-1] # K
-                    res['SEI_Thick'][i,k] = y_c[-2] * 1e9 # nm
-                    res['SOC'][i,k] = (y_c[self.battery.physics.Nr_n-1]/p['cs_max_n'] - 0.01)/0.94
-                    volts.append(bd['TermV'])
-                res['PackVoltage'][i] = np.sum(np.mean(np.array(volts).reshape(self.battery.n_series, self.battery.n_parallel), axis=1))
-
-        fig, axes = plt.subplots(4, 2, figsize=(16, 20), constrained_layout=True)
-        t_h = times
-        axes[0,0].plot(t_h, res['PackVoltage'], 'k'); axes[0,0].set_title('Pack Voltage')
-        ax2 = axes[0,0].twinx(); ax2.plot(t_h, np.full_like(t_h, I_pack), 'r--'); ax2.set_ylabel('Pack Current [A]')
-        for k in range(self.battery.n_cells): axes[0,1].plot(t_h, res['TermV'][:,k], label=f'C{k}')
-        axes[0,1].legend(); axes[0,1].set_title('Cell Voltages')
-        for k in range(self.battery.n_cells): axes[1,0].plot(t_h, res['Curr'][:,k])
-        axes[1,0].set_title('Cell Currents [A]')
-        for k in range(self.battery.n_cells): axes[1,1].plot(t_h, res['Temp'][:,k] - 273.15)
-        axes[1,1].set_title('Temperature [C]')
-        for k in range(self.battery.n_cells): axes[2,0].plot(t_h, res['SEI_Thick'][:,k])
-        axes[2,0].set_title('SEI Thickness [nm]')
-        for k in range(self.battery.n_cells): axes[2,1].plot(t_h, res['SOC'][:,k])
-        axes[2,1].set_title('SOC')
-        
-        idx_b = 1 if self.battery.n_cells > 1 else 0
-        stk1 = [res['TermV'][:,idx_b], res['SEI'][:,idx_b], res['OhmS'][:,idx_b], res['OhmE'][:,idx_b], res['Conc'][:,idx_b], res['Rxn'][:,idx_b]]
-        axes[3,0].stackplot(t_h, stk1, labels=['V','SEI','OhmS','OhmE','Conc','Rxn'], alpha=0.6)
-        axes[3,0].plot(t_h, res['OCV'][:,idx_b], 'k--'); axes[3,0].set_title(f'Breakdown C{idx_b}'); axes[3,0].legend(loc='lower left')
-        
-        idx_a = 0
-        stk0 = [res['TermV'][:,idx_a], res['SEI'][:,idx_a], res['OhmS'][:,idx_a], res['OhmE'][:,idx_a], res['Conc'][:,idx_a], res['Rxn'][:,idx_a]]
-        axes[3,1].stackplot(t_h, stk0, labels=['V','SEI','OhmS','OhmE','Conc','Rxn'], alpha=0.6)
-        axes[3,1].plot(t_h, res['OCV'][:,idx_a], 'k--'); axes[3,1].set_title(f'Breakdown C{idx_a}'); axes[3,1].legend(loc='lower left')
-        
-        plt.show()
-        pd.DataFrame({'time': times, 'pack_voltage': res['PackVoltage']}).to_csv('voltage_vs_time.csv', index=False)
-        print("Saved voltage_vs_time.csv")
+    def process_results(self, times, y_list, I_pack, out_dir="."):
+        proc = ResultsProcessor(self.battery, self, self.output_spec, out_dir)
+        proc.run(times, y_list, I_pack)
 
 
 class ControlledSolver:
-    def __init__(self, battery_solver):
+    def __init__(self, battery_solver, output_spec: OutputSpec | None = None):
         self.battery = battery_solver
+        self.output_spec = output_spec or _DEFAULT_SPEC
         self.core_solver = BasicSolver(battery_solver)
 
-    def simulate(self, t_end, dt_init, controller, dt_max=None):
+    def simulate(self, t_end, dt_init, controller, dt_max=None, out_dir=".", output_spec=None):
+        if output_spec is not None:
+            self.output_spec = output_spec
+        self._out_dir = out_dir
         t, dt = 0.0, dt_init
         dt_max = 5.0 if dt_max is None else dt_max
         times = [0.0]
         y_hist = [self.battery.y.clone().cpu()]
         I_pack_hist = [float(getattr(controller, 'initial_current', 0.0))]
+        
+        # Initialize cell currents for t=0
+        I_init_pack = I_pack_hist[0]
+        I_init_cells = self.battery.compute_effective_cell_currents(self.battery.y, I_init_pack)
+        I_cells_hist = [I_init_cells.clone().cpu()]
 
         print(f"Starting Controlled Simulation on {self.battery.device}")
         start_time = time.time()
@@ -534,6 +460,7 @@ class ControlledSolver:
                 times.append(t)
                 y_hist.append(self.battery.y.clone().cpu())
                 I_pack_hist.append(I_now)
+                I_cells_hist.append(I_cells.clone().cpu())
 
                 cell_voltages = self.battery.get_exact_terminal_voltages(self.battery.y, I_cells)
                 should_stop, stop_message = controller.should_stop(t, self.battery.y, cell_voltages, I_now)
@@ -554,115 +481,9 @@ class ControlledSolver:
                     break
 
         print(f"Complete in {time.time()-start_time:.2f}s")
-        self.process_results(times, y_hist, I_pack_hist)
+        self.process_results(times, y_hist, I_pack_hist, I_cells_hist, self._out_dir)
 
-    def process_results(self, times, y_list, I_pack_hist):
-        self.battery.output_manager.save(times, y_list, I_pack_hist, filename='all_results.csv')
-        print("Saved all_results.csv")
+    def process_results(self, times, y_list, I_pack_hist, I_cells_hist, out_dir="."):
+        proc = ResultsProcessor(self.battery, self.core_solver, self.output_spec, out_dir)
+        proc.run(times, y_list, I_pack_hist, I_cells_hist=I_cells_hist)
 
-        times = np.array(times)
-        y = torch.stack(y_list).numpy()
-        I_pack_hist = np.array(I_pack_hist)
-        n_steps = len(times)
-        res = {
-            k: np.zeros((n_steps, self.battery.n_cells))
-            for k in ['TermV', 'OCV', 'Rxn', 'OhmS', 'OhmE', 'Conc', 'SEI', 'Temp', 'Curr', 'SOC', 'SEI_Thick']
-        }
-        res['PackVoltage'] = np.zeros(n_steps)
-        res['PackCurrent'] = I_pack_hist
-
-        with torch.no_grad():
-            for i in range(n_steps):
-                y_t = torch.from_numpy(y[i]).to(self.battery.device)
-                I_now = float(I_pack_hist[i])
-                I_c_t = self.battery.compute_effective_cell_currents(y_t, I_now)
-                I_c = I_c_t.cpu().numpy().flatten()
-                res['Curr'][i, :] = I_c
-                volts = []
-                for k in range(self.battery.n_cells):
-                    p = self.battery.raw_params[k]
-                    y_c = y[i, k]
-                    bd = self.core_solver._get_voltage_breakdown_numpy(y_c, I_c[k], p)
-                    res['TermV'][i, k] = bd['TermV']
-                    res['OCV'][i, k] = bd['OCV']
-                    res['Rxn'][i, k] = bd['Rxn']
-                    res['OhmS'][i, k] = bd['OhmSolid']
-                    res['OhmE'][i, k] = bd['OhmElec']
-                    res['Conc'][i, k] = bd['Conc']
-                    res['SEI'][i, k] = bd['SEI']
-                    y_t_single = torch.from_numpy(y_c).unsqueeze(0).to(self.battery.device)
-                    res['Temp'][i, k] = self.battery.physics.state(y_t_single, 'temperature')[0].item()
-                    if 'Lsei' in self.battery.physics.state_layout.slices:
-                        res['SEI_Thick'][i, k] = self.battery.physics.state(y_t_single, 'Lsei')[0].item() * 1e9
-                    else:
-                        res['SEI_Thick'][i, k] = p['Lsei_0'] * 1e9
-                    
-                    cs_n_state = self.battery.physics.state(y_t_single, 'cs_n')[0].cpu().numpy()
-                    # Average over x for surface SOC
-                    surf_cs_n = np.mean(cs_n_state[self.battery.physics.Nr_n - 1::self.battery.physics.Nr_n])
-                    res['SOC'][i, k] = (surf_cs_n / p['cs_max_n'] - 0.01) / 0.94
-                    volts.append(bd['TermV'])
-                res['PackVoltage'][i] = np.sum(
-                    np.mean(np.array(volts).reshape(self.battery.n_series, self.battery.n_parallel), axis=1)
-                )
-
-        fig, axes = plt.subplots(4, 2, figsize=(16, 20), constrained_layout=True)
-        t_h = times
-        axes[0, 0].plot(t_h, res['PackVoltage'], 'k')
-        axes[0, 0].set_title('Pack Voltage')
-        ax2 = axes[0, 0].twinx()
-        ax2.plot(t_h, res['PackCurrent'], 'r--', label='Controller Output')
-        ax2.set_ylabel('Pack Current [A]')
-        axes[0, 0].legend()
-        ax2.legend(loc='upper right')
-
-        for k in range(self.battery.n_cells):
-            axes[0, 1].plot(t_h, res['TermV'][:, k], label=f'C{k}')
-        axes[0, 1].legend()
-        axes[0, 1].set_title('Cell Voltages')
-        for k in range(self.battery.n_cells):
-            axes[1, 0].plot(t_h, res['Curr'][:, k])
-        axes[1, 0].set_title('Cell Currents [A]')
-        for k in range(self.battery.n_cells):
-            axes[1, 1].plot(t_h, res['Temp'][:, k] - 273.15)
-        axes[1, 1].set_title('Temperature [C]')
-        for k in range(self.battery.n_cells):
-            axes[2, 0].plot(t_h, res['SEI_Thick'][:, k])
-        axes[2, 0].set_title('SEI Thickness [nm]')
-        for k in range(self.battery.n_cells):
-            axes[2, 1].plot(t_h, res['SOC'][:, k])
-        axes[2, 1].set_title('SOC')
-
-        idx_b = 1 if self.battery.n_cells > 1 else 0
-        stk1 = [
-            res['TermV'][:, idx_b],
-            res['SEI'][:, idx_b],
-            res['OhmS'][:, idx_b],
-            res['OhmE'][:, idx_b],
-            res['Conc'][:, idx_b],
-            res['Rxn'][:, idx_b],
-        ]
-        axes[3, 0].stackplot(t_h, stk1, labels=['V', 'SEI', 'OhmS', 'OhmE', 'Conc', 'Rxn'], alpha=0.6)
-        axes[3, 0].plot(t_h, res['OCV'][:, idx_b], 'k--')
-        axes[3, 0].set_title(f'Breakdown C{idx_b}')
-        axes[3, 0].legend(loc='lower left')
-
-        idx_a = 0
-        stk0 = [
-            res['TermV'][:, idx_a],
-            res['SEI'][:, idx_a],
-            res['OhmS'][:, idx_a],
-            res['OhmE'][:, idx_a],
-            res['Conc'][:, idx_a],
-            res['Rxn'][:, idx_a],
-        ]
-        axes[3, 1].stackplot(t_h, stk0, labels=['V', 'SEI', 'OhmS', 'OhmE', 'Conc', 'Rxn'], alpha=0.6)
-        axes[3, 1].plot(t_h, res['OCV'][:, idx_a], 'k--')
-        axes[3, 1].set_title(f'Breakdown C{idx_a}')
-        axes[3, 1].legend(loc='lower left')
-
-        plt.show()
-        pd.DataFrame(
-            {'time': times, 'pack_voltage': res['PackVoltage'], 'pack_current': res['PackCurrent']}
-        ).to_csv('sim_results.csv', index=False)
-        print("Saved sim_results.csv")

@@ -64,7 +64,7 @@ def get_circuit_parameters(physics, y_batch):
 
     R_solid_ohm = (p['Ln']/p['sigma_n'] + p['Lp']/p['sigma_p'])/(3.0 * p['A'])
     R_sei = Lsei / (p['as_n'] * p['A'] * p['Ln'] * p['kappa_sei'])
-    R_series = R_solid_ohm + R_electrolyte + R_sei 
+    R_series = R_solid_ohm + R_electrolyte + R_sei + p.get('R_contact', 0.0) + p.get('R_bus', 0.0) 
     
     return OCV, R_series, I0_n, I0_p, T_cell, V_conc
 
@@ -105,7 +105,8 @@ def compute_derivatives_functional(physics, y_flat, I_app, p, y_old=None, dt=Non
     
     R_sei = Lsei / (p['as_n'] * p['A'] * p['Ln'] * p['kappa_sei'])
     R_solid_ohm = (p['Ln']/p['sigma_n'] + p['Lp']/p['sigma_p'])/(3.0 * p['A'])
-    V_ohm_total = I_app * (R_solid_ohm + R_electrolyte + R_sei)
+    R_extra = p.get('R_contact', 0.0) + p.get('R_bus', 0.0)
+    V_ohm_total = I_app * (R_solid_ohm + R_electrolyte + R_sei + R_extra)
     
     ce_real = ce_eps / (physics.eps_vec + 1e-12)
     sqrt_ce_n_avg = torch.sum(torch.sqrt(torch.clamp(ce_real[:physics.Nx_n], min=1e-12)) * physics.W_n)

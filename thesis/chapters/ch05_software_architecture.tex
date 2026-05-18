@@ -1,0 +1,204 @@
+%% ============================================================
+%%  CHAPTER 5 — SOFTWARE ARCHITECTURE
+%% ============================================================
+\chapter{Software Architecture}
+\label{ch:software}
+
+\section{Design Philosophy}
+
+The \VIBE{} framework is designed around three principles: \emph{modularity} (each physics component is independently replaceable), \emph{declarativity} (PDEs are expressed symbolically, not procedurally), and \emph{performance} (all numerical operations are GPU-tensor-native).
+
+\section{Overall Architecture}
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  block/.style={rectangle, draw, rounded corners, fill=blue!10,
+    text width=3.5cm, align=center, minimum height=1.0cm, font=\small},
+  arrow/.style={-Stealth, thick},
+  node distance=1.2cm and 0.5cm
+]
+\node[block] (user) {User Script\\(\texttt{Experiment.py})};
+\node[block, below=of user] (solver) {\texttt{ImplicitBatterySolver}\\(pack orchestrator)};
+\node[block, below left=of solver] (physics) {\texttt{BatteryPhysics}\\(per-cell PDE eval)};
+\node[block, below right=of solver] (solver2) {\texttt{BasicSolver} /\\
+\texttt{AdvancedSolver}};
+\node[block, below=of physics] (pipeline) {\texttt{OperatorPDEPipeline}\\(equation registry)};
+\node[block, below=of pipeline] (models) {PDE Models:\\Spherical, FVM,\\FDM, Chebyshev};
+\node[block, below=of solver2] (pack) {Pack modules:\\Balancing,\\Cooling};
+\draw[arrow] (user) -- (solver);
+\draw[arrow] (solver) -- (physics);
+\draw[arrow] (solver) -- (solver2);
+\draw[arrow] (physics) -- (pipeline);
+\draw[arrow] (pipeline) -- (models);
+\draw[arrow] (solver) -- (pack);
+\end{tikzpicture}
+\caption{High-level software architecture of the \VIBE{} framework.}
+\label{fig:arch_overview}
+\end{figure}
+
+\section{Symbolic PDE Expression AST}
+\label{sec:symbolic_ast}
+
+The framework provides a symbolic abstract syntax tree (AST) for PDE definition, implemented in \texttt{pde\_framework.py} and \texttt{pde\_sim/symbolic/expressions.py}.
+
+\subsection{Expression Nodes}
+
+All AST nodes inherit from the \texttt{Expression} base class, which overloads Python arithmetic operators:
+
+\begin{lstlisting}[language=Python, caption={Expression class with operator overloading}]
+class Expression:
+    def __add__(self, other): return Add(self, ensure_expression(other))
+    def __mul__(self, other): return Multiply(self, ensure_expression(other))
+    def __neg__(self):        return Negate(self)
+    # ... (sub, div, pow, radd, rmul, etc.)
+\end{lstlisting}
+
+Leaf nodes include:
+\begin{itemize}
+  \item \texttt{Constant(value)} — a literal scalar
+  \item \texttt{Variable(name)} / \texttt{Field(name)} — a solved state (unknown)
+  \item \texttt{Parameter(name)} / \texttt{Param(name)} — a runtime coefficient
+\end{itemize}
+
+Differential operator nodes include:
+\begin{itemize}
+  \item \texttt{Grad(expr)} — spatial gradient $\nabla(\cdot)$
+  \item \texttt{Div(expr)} — divergence $\nabla \cdot (\cdot)$
+  \item \texttt{Laplacian(expr)} — $\nabla^2(\cdot) = \nabla \cdot \nabla(\cdot)$
+  \item \texttt{SphericalDiv(expr, radius)} — $(1/r^2)\partial_r(r^2 \cdot)$
+  \item \texttt{Dt(expr)} — time derivative $\partial_t(\cdot)$ (for LHS notation)
+\end{itemize}
+
+With these primitives, the solid diffusion PDE can be declared as:
+
+\begin{lstlisting}[language=Python, caption={Declarative PDE for solid diffusion}]
+c = Field("cs_n")
+D = Param("diffusivity")
+r = Param("particle_radius")
+# Declares: dc/dt = (1/r^2) * d/dr(r^2 * D * dc/dr)
+rhs = SphericalDiv(D * Grad(c), r)
+\end{lstlisting}
+
+and the electrolyte transport PDE as:
+
+\begin{lstlisting}[language=Python, caption={Declarative PDE for electrolyte transport}]
+ce = Field("ce")
+D_eff = Param("flux_coefficient")   # negative of diffusivity
+source = Param("source")
+rhs = -Div(D_eff * Grad(ce)) + source
+\end{lstlisting}
+
+\subsection{Expression Evaluator (\texttt{discretize})}
+
+The \texttt{discretize(expr, context)} function recursively walks the AST and replaces each node with its discretised tensor equivalent:
+
+\begin{align}
+  \texttt{Grad}(u) &\rightarrow \mathbf{G}_h \cdot \mathbf{u} \label{eq:discretize_grad}\\
+  \texttt{Div}(F) &\rightarrow \mathbf{D}_h \cdot \mathbf{F} \label{eq:discretize_div}\\
+  \texttt{Multiply}(a, b) &\rightarrow a_h \odot b_h \label{eq:discretize_mul}
+\end{align}
+where $\mathbf{G}_h$ and $\mathbf{D}_h$ are the discrete gradient and divergence matrices of the active operator backend.
+
+\section{State Layout Registry}
+\label{sec:state_layout}
+
+The \texttt{StateLayout} class manages the flat state vector $\mathbf{y} \in \mathbb{R}^{N_\text{state}}$:
+
+\begin{lstlisting}[language=Python, caption={State registration example}]
+layout = StateLayout()
+layout.register("cs_n",        size=Nr_n,  initial=29866.0, scale=30000.0)
+layout.register("cs_p",        size=Nr_p,  initial=17038.0, scale=30000.0)
+layout.register("electrolyte", size=Nel,   initial=eps*ce0,  scale=1000.0)
+layout.register("Lsei",        size=1,     initial=5e-9,    scale=1e-8)
+layout.register("temperature", size=1,     initial=298.15,  scale=300.0)
+\end{lstlisting}
+
+Each field occupies a contiguous slice of $\mathbf{y}$. The slices are computed automatically as fields are registered. Key methods:
+\begin{itemize}
+  \item \texttt{get(y, name)} — returns the tensor slice for field \texttt{name}
+  \item \texttt{pack(derivatives)} — assembles the full $\dot{\mathbf{y}}$ vector
+  \item \texttt{initial\_state(params\_list)} — builds the initial condition batch
+  \item \texttt{scale\_vector()} — returns $\mathbf{S}$ for Newton convergence scaling
+  \item \texttt{nonnegative\_mask()} — boolean mask for line-search enforcement
+\end{itemize}
+
+\section{Operator PDE Pipeline}
+\label{sec:operator_pipeline}
+
+The \texttt{OperatorPDEPipeline} is a registry that maps state names to discretised PDE models. Three model types are supported:
+
+\begin{description}
+  \item[\texttt{SphericalParticlePDEModel}] for solid diffusion in spherical coordinates (Chebyshev backend). Manages flux BC at the surface and symmetry BC at the centre.
+  \item[\texttt{ConservativeFluxPDEModel}] (alias \texttt{ElectrolytePDEModel}) for conservative $-\nabla \cdot (\mathbf{D}\nabla c) + S$ form with FVM or Chebyshev backends.
+  \item[\texttt{GeneralOperatorPDEModel}] for arbitrary expression-based PDEs without special boundary flux handling.
+\end{description}
+
+Adding a new PDE requires only:
+\begin{enumerate}
+  \item Declaring an \texttt{OperatorEquationSpec} with the symbolic RHS expression.
+  \item Adding a \texttt{StateEquationSpec} entry to the \texttt{STATE\_EQUATIONS} registry in \texttt{model\_registry.py}.
+  \item Providing runtime parameter resolvers (can be context values, parameter lookups, or callables).
+\end{enumerate}
+
+\section{Model Registry and State Equations}
+\label{sec:model_registry}
+
+The \texttt{STATE\_EQUATIONS} dictionary in \texttt{model\_registry.py} is the single source of truth for all solved states:
+
+\begin{table}[H]
+\centering
+\caption{Registered state equations in the \VIBE{} framework.}
+\label{tab:state_equations}
+\small
+\begin{tabular}{llcp{5.5cm}}
+\toprule
+\textbf{Key} & \textbf{Order} & \textbf{Size} & \textbf{Governing Equation} \\
+\midrule
+\texttt{cs\_n} & 10 & $N_{r,n}$ & $\partial_t c_{s,n} = D_{s,n} r^{-2}\partial_r(r^2 \partial_r c_{s,n})$ \\
+\texttt{cs\_p} & 20 & $N_{r,p}$ & $\partial_t c_{s,p} = D_{s,p} r^{-2}\partial_r(r^2 \partial_r c_{s,p})$ \\
+\texttt{electrolyte} & 30 & $N_{x,n}+N_{x,s}+N_{x,p}$ & $\partial_t \hat{c}_e = -\nabla\cdot(-D_\text{eff}\nabla c_e) + S_e$ \\
+\texttt{stress} & 40 & $N_\text{el}$ & $\partial_t \sigma = -\nabla\cdot(-D_\sigma\nabla\sigma) + \lambda(c_e - c_{e,0}) - \mu\sigma$ (optional) \\
+\texttt{sei} & 80 & $N_\text{sei}$ & Reserved (algebraic) \\
+\texttt{Lsei} & 90 & 1 & $\dot{L}_\text{SEI} = -(V_\text{bar}/(\mathcal{F} z)) j_\text{SEI}$ \\
+\texttt{temperature} & 1000 & 1 & $\dot{T} = (Q_\text{gen} - Q_\text{cool}) / (\rho C_p V)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The \texttt{order} field controls the position of each state in the flat vector. Temperature is always placed last (order 1000) because the solver appends pack-level conduction to the final state entry.
+
+\section{Discretisation Backends}
+\label{sec:disc_backends}
+
+Three operator backends are implemented, all sharing the same interface (\texttt{gradient()}, \texttt{divergence()}, \texttt{face\_coefficients()}):
+
+\begin{description}
+  \item[\texttt{ChebyshevRegionOperators}] Block-diagonal Chebyshev differentiation matrices, one per mesh region. Spectral accuracy for smooth profiles.
+  \item[\texttt{FiniteVolumeOperators}] Cell-centred FVM with harmonic-mean interface diffusivities. Exact flux conservation. Preferred for through-cell transport.
+  \item[\texttt{FiniteDifferenceOperators}] Node-centred central differences. Second-order convergence. Included for comparison studies.
+\end{description}
+
+Selection is made at runtime via the \texttt{config} dictionary:
+\begin{lstlisting}[language=Python, caption={Runtime discretisation selection}]
+config = {
+    "electrolyte_spatial_method": "finite_volume",  # or "chebyshev", "finite_difference"
+    "solid_spatial_method":        "chebyshev",
+}
+\end{lstlisting}
+
+\section{Composite Mesh}
+\label{sec:composite_mesh}
+
+The \texttt{CompositeMesh} class stitches together region-wise meshes into a single global mesh object. Each region is defined by a length and a node count:
+
+\begin{lstlisting}[language=Python, caption={Composite electrolyte mesh construction}]
+region_spec = {
+    'negative':  {'length': Ln, 'N': Nx_n},
+    'separator': {'length': Ls, 'N': Nx_s},
+    'positive':  {'length': Lp, 'N': Nx_p},
+}
+mesh = CompositeMesh(region_spec, method='finite_volume')
+\end{lstlisting}
+
+The mesh stores: node coordinates, cell widths, face positions, and region-to-slice mappings, enabling each operator to act on the correct sub-domain.

@@ -1,11 +1,13 @@
 import torch
 from main import ImplicitBatterySolver
 from controllers import build_controller
+from pde_sim.output import OutputSpec
 
 # ==============================================================================
 # 1. Physics & Simulation Settings
 # ==============================================================================
 config = {
+    'device': 'auto',   # 'auto' = use GPU if available, or set 'cpu' / 'cuda' explicitly
     'n_series': 2,      
     'n_parallel': 1,   
     'electrolyte_spatial_method': 'finite_volume',  
@@ -74,7 +76,27 @@ thermal_options = {
 }
 
 # ==============================================================================
-# 4. Run Simulation
+# 4. Output Specification (liionpack-style selective saving)
+# ==============================================================================
+# Choose which variables to compute and save to simulation_results.npz.
+# - "default"  → voltage, current, SOC, temperature, SEI thickness, pack V/I,
+#                 all overpotentials (rxn, ohmic solid/electrolyte, conc, SEI,
+#                 contact resistance drop, busbar resistance drop)
+# - "all"      → every available output
+# - list       → only the named outputs
+#
+# Resistance values in standard parameters now match liionpack defaults:
+#   R_contact = 1e-2 Ω  (Tranter et al. 2022, Rc = 10 mΩ)
+#   R_bus     = 1e-4 Ω  (Tranter et al. 2022, Rb = 0.1 mΩ)
+output_spec = OutputSpec("default")
+
+# Alternative examples:
+# output_spec = OutputSpec(["terminal_voltage", "temperature", "soc"])
+# output_spec = OutputSpec(["default", "contact_resistance_drop"])
+# output_spec = OutputSpec("all")
+
+# ==============================================================================
+# 5. Run Simulation
 # ==============================================================================
 if __name__ == "__main__":
     solver = ImplicitBatterySolver(
@@ -94,5 +116,6 @@ if __name__ == "__main__":
         t_end=360000, 
         dt_init=1.0,
         controller=controller,
-        dt_max=50.0
+        dt_max=50.0,
+        output_spec=output_spec,
     )

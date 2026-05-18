@@ -1,0 +1,96 @@
+%% ============================================================
+%%  APPENDIX A — CELL PARAMETERS
+%% ============================================================
+\chapter{Chen2020 NMC/Graphite Parameter Set}
+\label{app:parameters}
+
+All simulations in this thesis use the Chen2020 parameter set~\cite{Chen2020} unless otherwise stated. \Cref{tab:params_geometry} through \cref{tab:params_degradation} list all parameter values with units and sources.
+
+\begin{table}[H]
+\centering
+\caption{Electrode geometry and volume fraction parameters.}
+\label{tab:params_geometry}
+\begin{tabular}{llll}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Negative electrode thickness & $L_n$ & $8.52\times10^{-5}$ & m \\
+Separator thickness & $L_s$ & $1.20\times10^{-5}$ & m \\
+Positive electrode thickness & $L_p$ & $7.56\times10^{-5}$ & m \\
+Electrode area & $A$ & $1.027\times10^{-1}$ & m$^2$ \\
+Negative particle radius & $R_{s,n}$ & $5.86\times10^{-6}$ & m \\
+Positive particle radius & $R_{s,p}$ & $5.22\times10^{-6}$ & m \\
+Negative electrolyte fraction & $\varepsilon_{e,n}$ & $0.25$ & -- \\
+Separator electrolyte fraction & $\varepsilon_{e,s}$ & $0.47$ & -- \\
+Positive electrolyte fraction & $\varepsilon_{e,p}$ & $0.335$ & -- \\
+Bruggeman exponent & $b$ & $1.5$ & -- \\
+Negative specific area & $a_{s,n}$ & $3.83\times10^5$ & m$^{-1}$ \\
+Positive specific area & $a_{s,p}$ & $3.82\times10^5$ & m$^{-1}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Solid-phase transport and kinetic parameters.}
+\label{tab:params_solid}
+\begin{tabular}{llll}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Negative diffusivity & $D_{s,n}$ & $3.3\times10^{-14}$ & m$^2$/s \\
+Positive diffusivity & $D_{s,p}$ & $4.0\times10^{-15}$ & m$^2$/s \\
+Maximum neg.\ conc. & $c_{s,\max,n}$ & $33133$ & mol/m$^3$ \\
+Maximum pos.\ conc. & $c_{s,\max,p}$ & $63104$ & mol/m$^3$ \\
+Neg.\ electronic conductivity & $\sigma_n$ & $215$ & S/m \\
+Pos.\ electronic conductivity & $\sigma_p$ & $0.18$ & S/m \\
+Neg.\ ref.\ reaction rate & $m_{\text{ref},n}$ & $6.48\times10^{-7}$ & A/m$^{3.5}$ \\
+Pos.\ ref.\ reaction rate & $m_{\text{ref},p}$ & $3.42\times10^{-6}$ & A/m$^{3.5}$ \\
+Neg.\ activation energy & $E_{r,n}$ & $35000$ & J/mol \\
+Pos.\ activation energy & $E_{r,p}$ & $17800$ & J/mol \\
+Transference number & $t_+$ & $0.2594$ & -- \\
+Initial electrolyte conc. & $c_{e,0}$ & $1000$ & mol/m$^3$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{Thermal parameters.}
+\label{tab:params_thermal}
+\begin{tabular}{llll}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Cell volume & $V_\text{cell}$ & $2.42\times10^{-5}$ & m$^3$ \\
+Volumetric heat capacity & $\rho C_p$ & $1.7676\times10^6$ & J/(m$^3$K) \\
+Convection coefficient & $hA$ & $0.0531$ & W/K \\
+Ambient temperature & $T_\text{amb}$ & $298.15$ & K \\
+Thermal contact conductance & $k_c A_c / d$ & $0.125$ & W/K \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[H]
+\centering
+\caption{SEI and degradation parameters.}
+\label{tab:params_degradation}
+\begin{tabular}{llll}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Value} & \textbf{Unit} \\
+\midrule
+Initial SEI thickness & $L_\text{SEI,0}$ & $5\times10^{-9}$ & m \\
+SEI ionic conductivity & $\kappa_\text{SEI}$ & $5\times10^{-6}$ & S/m \\
+SEI molar mass & $\mathcal{M}_\text{SEI}$ & $0.162$ & kg/mol \\
+SEI density & $\rho_\text{SEI}$ & $1690$ & kg/m$^3$ \\
+SEI equilibrium potential & $U_\text{SEI}$ & $0.4$ & V \\
+SEI partial molar volume & $\bar{V}_\text{SEI}$ & $9.585\times10^{-5}$ & m$^3$/mol \\
+Graphite Young's modulus & $E_g$ & $15\times10^9$ & Pa \\
+Graphite Poisson's ratio & $\nu_g$ & $0.3$ & -- \\
+SEI Young's modulus & $E_\text{SEI}$ & $10\times10^9$ & Pa \\
+SEI Poisson's ratio & $\nu_\text{SEI}$ & $0.25$ & -- \\
+Li partial molar volume & $\Omega$ & $3.17\times10^{-6}$ & m$^3$/mol \\
+Fracture toughness & $K_{Ic}$ & $0.3\times10^6$ & Pa$\sqrt{\text{m}}$ \\
+\bottomrule
+\end{tabular}
+\end{table}

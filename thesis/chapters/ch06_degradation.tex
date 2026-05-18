@@ -1,0 +1,212 @@
+%% ============================================================
+%%  CHAPTER 6 — DEGRADATION MODELS
+%% ============================================================
+\chapter{Degradation Physics}
+\label{ch:degradation}
+
+\section{Overview}
+
+Degradation in lithium-ion cells is a coupled, multi-mechanism process. The three mechanisms modelled in this thesis are: (i) SEI growth, (ii) lithium plating, and (iii) diffusion-induced mechanical stress with crack-enhanced SEI. All models are implemented in a plug-and-play registry and operate on the same state vector and electrochemical driving forces, enabling direct mechanistic comparison.
+
+\section{The SEI Formation Current}
+\label{sec:sei_physics}
+
+\subsection{SEI Overpotential}
+
+The SEI formation reaction is an electrochemical reduction at the anode particle surface. Its driving force is the SEI overpotential, defined as (following PyBaMM convention~\cite{Sulzer2021}):
+\begin{equation}
+  \eta_\text{SEI} = U_n - U_\text{SEI} - i_n \frac{L_\text{SEI}}{\kappa_\text{SEI}}
+  \label{eq:eta_sei}
+\end{equation}
+where $U_n$ is the anode OCP, $U_\text{SEI} = 0.4$~V is the equilibrium potential of the SEI formation reaction, $i_n$~[\si{\ampere\per\meter\squared}] is the local intercalation current density, and $\kappa_\text{SEI} = 5\times10^{-6}$~\si{\siemens\per\meter} is the SEI ionic conductivity. The term $i_n L_\text{SEI}/\kappa_\text{SEI}$ is the resistive voltage drop across the SEI film~[\si{\volt}].
+
+\subsection{SEI Thickness Growth}
+
+Once the SEI current density $j_\text{SEI}$~[\si{\ampere\per\meter\squared}] (negative by convention, as it is a reduction) is computed by any of the models below, the thickness evolution is:
+\begin{equation}
+  \ddt{L_\text{SEI}} = -\frac{\bar{V}_\text{SEI}}{\mathcal{F} \cdot z_\text{SEI}} j_\text{SEI}
+  \label{eq:Lsei_ode}
+\end{equation}
+where $\bar{V}_\text{SEI} = 9.585\times10^{-5}$~\si{\meter\cubed\per\mol} is the partial molar volume of the SEI product and $z_\text{SEI} = 2$ is the number of electrons per reaction. The positive sign of $\dot{L}_\text{SEI}$ (growth) follows from $j_\text{SEI} < 0$.
+
+The total side-reaction current that reduces the lithiation flux:
+\begin{equation}
+  g_\text{side} = a_{s,n} \cdot L_n \cdot A \cdot i_\text{side}, \quad i_\text{side} = -j_\text{SEI}
+  \label{eq:g_side}
+\end{equation}
+
+\section{SEI Growth Mechanisms}
+\label{sec:sei_mechanisms}
+
+\subsection{Model 1: Constant (Baseline)}
+\begin{equation}
+  j_\text{SEI} = 0
+  \label{eq:sei_constant}
+\end{equation}
+No SEI growth. Used to isolate electrochemical effects from degradation.
+
+\subsection{Model 2: Solvent-Diffusion Limited (Safari 2009)~\cite{Safari2009}}
+
+The rate-limiting step is diffusion of solvent molecules through the SEI:
+\begin{equation}
+  j_\text{SEI} = -\frac{\mathcal{F} D_\text{sol} c_\text{sol}}{L_\text{SEI}}
+  \label{eq:sei_solvent}
+\end{equation}
+Parameters: $D_\text{sol} = 2.5\times10^{-22}$~\si{\meter\squared\per\second} (Chen2020), $c_\text{sol} = 2636$~\si{\mol\per\meter\cubed}. This gives a parabolic long-term growth $L_\text{SEI} \propto \sqrt{t}$ and is self-limiting ($j_\text{SEI} \to 0$ as $L_\text{SEI} \to \infty$).
+
+\subsection{Model 3: Reaction Limited (Ramadass 2004)~\cite{Ramadass2004}}
+
+The electrochemical reduction reaction at the SEI--electrolyte interface is rate-limiting:
+\begin{equation}
+  j_\text{SEI} = -j_{0,\text{SEI}} \exp\!\left(-\frac{\alpha_\text{SEI} \mathcal{F} \eta_\text{SEI}}{\mathcal{R} T}\right)
+  \label{eq:sei_reaction}
+\end{equation}
+Parameters: $j_{0,\text{SEI}} = 1.5\times10^{-7}$~\si{\ampere\per\meter\squared}, $\alpha_\text{SEI} = 0.5$. The growth is exponentially sensitive to temperature and overpotential. This is the model selected in the heterogeneity experiment (\texttt{test\_5s5p\_heterogeneity.py}).
+
+\subsection{Model 4: Interstitial-Diffusion Limited (Ploehn 2004)~\cite{Ploehn2004}}
+
+Interstitial lithium ions diffuse through the SEI crystal lattice:
+\begin{equation}
+  j_\text{SEI} = -\frac{\mathcal{F} D_\text{Li} c_\text{Li,0}}{L_\text{SEI}} \exp\!\left(-\frac{\mathcal{F} U_n}{\mathcal{R} T}\right)
+  \label{eq:sei_interstitial}
+\end{equation}
+Parameters: $D_\text{Li} = 10^{-20}$~\si{\meter\squared\per\second}, $c_\text{Li,0} = 15$~\si{\mol\per\meter\cubed}. The anode OCP $U_n$ enters as a Boltzmann-type activation factor.
+
+\subsection{Model 5: EC-Reaction Limited (Pinson \& Bazant 2012)~\cite{Pinson2012}}
+
+This combined model accounts for ethylene carbonate (EC) diffusion and surface reaction:
+\begin{equation}
+  j_\text{SEI} = -\frac{\mathcal{F} c_\text{EC} k_\text{SEI} \exp(-\alpha_\text{SEI} \mathcal{F}\eta_\text{SEI}/\mathcal{R}T)}{1 + (L_\text{SEI}/D_\text{EC}) k_\text{SEI} \exp(-\alpha_\text{SEI} \mathcal{F}\eta_\text{SEI}/\mathcal{R}T)}
+  \label{eq:sei_ec}
+\end{equation}
+Parameters: $k_\text{SEI} = 10^{-12}$~m/s, $D_\text{EC} = 2\times10^{-18}$~\si{\meter\squared\per\second}, $c_\text{EC} = 4541$~\si{\mol\per\meter\cubed}. At small $L_\text{SEI}$, this is reaction-limited; at large $L_\text{SEI}$, it transitions to diffusion-limited, naturally capturing both regimes.
+
+\subsection{Model 6: Electron-Migration Limited (Peled 1979)~\cite{Peled1979}}
+
+Electronic conduction through the SEI film controls the rate:
+\begin{equation}
+  j_\text{SEI} = \min\!\left(0,\; \frac{\kappa_\text{inner}(U_n - U_\text{SEI})}{L_\text{SEI}}\right)
+  \label{eq:sei_electron}
+\end{equation}
+Parameter: $\kappa_\text{inner} = 8.95\times10^{-10}$~\si{\siemens\per\meter}. The $\min$ clamp enforces that SEI formation is purely reductive ($j_\text{SEI} \leq 0$).
+
+\subsection{Model 7: Tunnelling Model (Monroe 2017)~\cite{Monroe2017}}
+
+At thin SEI, quantum tunnelling through the film is the limiting step:
+\begin{equation}
+  j_\text{SEI} = -j_{0,\text{SEI}} \exp\!\left(-\frac{\alpha_\text{SEI}\mathcal{F}\eta_\text{SEI}}{\mathcal{R}T}\right) \exp(-\beta L_\text{SEI})
+  \label{eq:sei_tunnelling}
+\end{equation}
+Parameter: $\beta = 10^9$~m$^{-1}$ (tunnelling decay constant). The second exponential provides exponentially self-limiting growth as the film thickens beyond the tunnelling range ($\sim$1--5~nm).
+
+\subsection{Built-In Stress-Enhanced Model}
+
+The built-in model (default) is an empirical formulation with stress enhancement:
+\begin{equation}
+  j_\text{SEI,base} = C_1 \exp(-C_2 L_\text{SEI}) \exp\!\left(-\frac{\alpha \mathcal{F} \phi_{s,n}}{\mathcal{R}T}\right) + \frac{\mathcal{F} C_3}{L_\text{SEI}} \exp\!\left(-\frac{U_n \mathcal{F}}{\mathcal{R}T}\right)
+  \label{eq:sei_builtin}
+\end{equation}
+\begin{equation}
+  j_\text{SEI} = j_\text{SEI,base} \cdot \xi_\text{stress}
+  \label{eq:sei_builtin_enhanced}
+\end{equation}
+where $\xi_\text{stress}$ is the stress enhancement factor (see \cref{sec:stress_models}).
+
+\section{Lithium Plating Models}
+\label{sec:li_plating}
+
+Lithium plating occurs when the anode potential falls below 0~V vs.\ Li/Li$^+$ ($\eta_\text{Li} = \phi_{s,n} < 0$). The three plating models implemented are:
+
+\subsection{Symmetric Butler--Volmer (Built-in)}
+\begin{equation}
+  i_\text{plating} = j_{0,\text{Li}}\left[\exp\!\left(-\frac{\alpha_\text{Li}\mathcal{F}\eta_\text{Li}}{\mathcal{R}T}\right) - \exp\!\left(\frac{\alpha_\text{Li}\mathcal{F}\eta_\text{Li}}{\mathcal{R}T}\right)\right]
+  \label{eq:plating_bv}
+\end{equation}
+
+\subsection{Irreversible Plating}
+
+Only the deposition branch is active:
+\begin{equation}
+  i_\text{plating} = j_{0,\text{Li}} \exp\!\left(-\frac{\alpha_\text{Li}\mathcal{F}\eta_\text{Li}}{\mathcal{R}T}\right) \cdot \mathbf{1}[\eta_\text{Li} < 0]
+  \label{eq:plating_irrev}
+\end{equation}
+
+\subsection{Yang 2017 Asymmetric Model~\cite{Yang2017}}
+
+Different exchange current densities for plating ($j_{0,\text{Li}}$) and stripping ($j_{0,\text{strip}}$):
+\begin{equation}
+  i_\text{plating} = \sigma(\eta_\text{Li}) \cdot \left[-j_{0,\text{Li}} e^{-\alpha_\text{Li}\mathcal{F}\eta_\text{Li}/\mathcal{R}T}\right] + (1-\sigma(\eta_\text{Li})) \cdot j_{0,\text{strip}} e^{\alpha_\text{Li}\mathcal{F}\eta_\text{Li}/\mathcal{R}T}
+  \label{eq:plating_yang}
+\end{equation}
+where $\sigma(\eta) = (1 - \tanh(\eta/0.001))/2$ is a smooth switch. Parameters: $j_{0,\text{Li}} = 10^{-6}$~\si{\ampere\per\meter\squared}, $j_{0,\text{strip}} = 10^{-4}$~\si{\ampere\per\meter\squared}. The molar rate of lithium deposition is:
+\begin{equation}
+  \ddt{n_\text{Li}} = -\frac{i_\text{plating}}{\mathcal{F}} \quad [\si{\mol\per\meter\squared\per\second}]
+  \label{eq:dn_Li_dt}
+\end{equation}
+
+\section{Mechanical Stress Models}
+\label{sec:stress_models}
+
+\subsection{Diffusion-Induced Stress (DIS)}
+
+Within a spherical graphite particle, the lithium concentration gradient between the bulk ($\bar{c}_s$) and the surface ($c_{s,\text{surf}}$) creates biaxial stress~\cite{Christensen2006}. The radial and tangential stress components are:
+\begin{align}
+  \sigma_r(r) &= \frac{2E\Omega}{3(1-\nu)}\left(\bar{c}_s - \bar{c}_s(r)\right) \label{eq:sigma_r}\\
+  \sigma_\theta(r) &= \frac{E\Omega}{3(1-\nu)}\left(2\bar{c}_s + \bar{c}_s(r) - 3 c_s(r)\right) \label{eq:sigma_theta}
+\end{align}
+where $\bar{c}_s(r) = (3/r^3)\int_0^r c_s r'^2\,dr'$ is the local volume-averaged concentration, $E_g = 15$~GPa, $\nu_g = 0.3$, and $\Omega = 3.17\times10^{-6}$~\si{\meter\cubed\per\mol}.
+
+The surface tangential stress (most relevant for cracking):
+\begin{equation}
+  \sigma_\text{th,surf} = \frac{E_g\Omega}{3(1-\nu_g)}\cdot 3(\bar{c}_s - c_{s,\text{surf}})
+  \label{eq:sigma_th_surf}
+\end{equation}
+
+The volume-averaged concentration is computed using the discrete shell volumes on the Chebyshev mesh:
+\begin{equation}
+  \bar{c}_s = \frac{\sum_i c_{s,i} v_i}{\sum_i v_i}, \quad v_i = r_{i+1/2}^3 - r_{i-1/2}^3
+  \label{eq:c_bar}
+\end{equation}
+
+\subsection{SEI Mismatch Stress}
+
+The SEI film has different molar volume from graphite, generating a mismatch stress~\cite{Reniers2019}:
+\begin{equation}
+  \sigma_\text{SEI} = \frac{E_\text{SEI}}{1-\nu_\text{SEI}} \cdot \frac{\Omega}{3}(c_{s,\text{surf}} - c_{s,\text{ref}}) + \sigma_\text{intr}
+  \label{eq:sigma_sei}
+\end{equation}
+where $E_\text{SEI} = 10$~GPa, $\nu_\text{SEI} = 0.25$, $c_{s,\text{ref}} = 0.8 c_{s,\max}$, and $\sigma_\text{intr} = -0.5$~GPa is the intrinsic compressive stress.
+
+\subsection{Crack Detection and SEI Enhancement}
+
+The total surface stress is:
+\begin{equation}
+  \sigma_\text{tot} = \sigma_\text{th,surf} + \sigma_\text{SEI}
+  \label{eq:sigma_tot}
+\end{equation}
+A crack is considered to open when $\sigma_\text{tot}$ exceeds the fracture toughness threshold~\cite{Zhao2011}:
+\begin{equation}
+  \sigma_\text{crack} = \frac{K_{Ic}}{\sqrt{\pi L_\text{SEI}}}
+  \label{eq:crack_threshold}
+\end{equation}
+where $K_{Ic} = 0.3$~\si{\mega\pascal\sqrt{\meter}}. The crack probability function uses a smooth sigmoid:
+\begin{equation}
+  \xi_\text{crack} = \frac{1}{2}\left[1 + \tanh\!\left(\frac{\sigma_\text{tot} - \sigma_\text{crack}}{10^5}\right)\right] \in [0,1]
+  \label{eq:crack_flag}
+\end{equation}
+The stress enhancement factor for the SEI side reaction:
+\begin{equation}
+  \xi_\text{stress} = 1 + 3\xi_\text{crack} \in [1, 4]
+  \label{eq:stress_enhancement}
+\end{equation}
+Thus, cracking can amplify the SEI formation current by up to a factor of 4, consistent with the findings of Reniers et al.~\cite{Reniers2019}.
+
+\section{Capacity Fade Estimation}
+\label{sec:capacity_fade}
+
+SEI growth consumes active lithium that is permanently lost from cycling. The capacity fade due to SEI is estimated as~\cite{Pinson2012}:
+\begin{equation}
+  \Delta Q_\text{fade} [\%] = \frac{2 \rho_\text{SEI}}{\mathcal{M}_\text{SEI}} \cdot \Delta L_\text{SEI} \cdot \frac{3}{R_{s,n}} \cdot \frac{100}{c_{s,\max,n}}
+  \label{eq:capacity_fade}
+\end{equation}
+where $\rho_\text{SEI} = 1690$~\si{\kilogram\per\meter\cubed} and $\mathcal{M}_\text{SEI} = 0.162$~\si{\kilogram\per\mol}. This is the \texttt{capacity\_fade\_pct} derived output in \texttt{model\_registry.py}.

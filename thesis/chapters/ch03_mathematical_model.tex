@@ -1,0 +1,308 @@
+%% ============================================================
+%%  CHAPTER 3 — MATHEMATICAL MODEL
+%% ============================================================
+\chapter{Mathematical Model}
+\label{ch:math_model}
+
+\section{Overview of the Coupled Physics}
+
+The \VIBE{} framework solves a coupled system of PDEs governing:
+(i) solid-phase lithium diffusion in spherical electrode particles,
+(ii) electrolyte-phase transport across the through-cell domain,
+(iii) electrochemical reaction kinetics via Butler--Volmer,
+(iv) thermal dynamics via a lumped energy balance, and
+(v) for each cell embedded in an $N_s \times N_p$ pack, the electrical
+network equations governing current distribution.
+
+\section{Solid-Phase Lithium Diffusion}
+\label{sec:solid_diffusion}
+
+\subsection{Governing Equation}
+
+Each electrode particle is modelled as an isotropic sphere of radius $R_s$ with radially symmetric diffusion. The governing PDE in spherical coordinates is:
+\begin{equation}
+  \pd{c_s}{t} = \frac{D_s}{r^2}\pd{}{r}\!\left(r^2\pd{c_s}{r}\right),
+  \quad 0 < r < R_s,\quad t > 0
+  \label{eq:solid_diff}
+\end{equation}
+where $c_s(r,t)$~[\si{\mol\per\meter\cubed}] is the lithium concentration in the solid, $D_s$~[\si{\meter\squared\per\second}] is the solid-phase diffusivity (assumed constant), and $r$ is the radial coordinate.
+
+\subsection{Boundary Conditions}
+
+At the particle centre, spherical symmetry requires:
+\begin{equation}
+  \pd{c_s}{r}\bigg|_{r=0} = 0
+  \label{eq:bc_centre}
+\end{equation}
+At the particle surface ($r = R_s$), the flux is set by the intercalation current density:
+\begin{equation}
+  -D_s \pd{c_s}{r}\bigg|_{r=R_s} = \frac{j_n}{a_s \mathcal{F}}
+  \label{eq:bc_surface}
+\end{equation}
+where $j_n$~[\si{\ampere\per\meter\squared}] is the pore-wall flux and $a_s = 3\varepsilon_s/R_s$~[\si{\per\meter}] is the specific interfacial area. For the negative electrode, the effective flux accounting for the SEI side reaction is:
+\begin{equation}
+  j_{n,\text{eff}} = \frac{I_\text{app} - g_\text{side}}{A \cdot L_n \cdot \mathcal{F} \cdot a_{s,n}}
+  \label{eq:flux_n_sei}
+\end{equation}
+where $g_\text{side} = a_{s,n} L_n A \cdot i_\text{side}$ is the total side-reaction current~[\si{\ampere}].
+
+\subsection{Dimensionless Formulation}
+
+Defining $\tilde{r} = r/R_s$ and $\tilde{c}_s = c_s/c_{s,\max}$, \cref{eq:solid_diff} becomes:
+\begin{equation}
+  \pd{\tilde{c}_s}{\tilde{t}} = \frac{1}{\tilde{r}^2}\pd{}{\tilde{r}}\!\left(\tilde{r}^2\pd{\tilde{c}_s}{\tilde{r}}\right), \quad \tilde{t} = D_s t / R_s^2
+  \label{eq:solid_diff_nondim}
+\end{equation}
+The characteristic diffusion timescale is $\tau_s = R_s^2/D_s$. For the parameters used in this work ($R_s \approx 5.86 \times 10^{-6}$~m, $D_s \approx 3.3\times10^{-14}$~\si{\meter\squared\per\second}), $\tau_s \approx 1040$~s.
+
+\section{Electrolyte Transport}
+\label{sec:electrolyte_transport}
+
+\subsection{Governing Equation}
+
+The lithium-ion concentration in the electrolyte $c_e(x,t)$~[\si{\mol\per\meter\cubed}], where $x$ is the through-cell spatial coordinate, evolves according to the concentrated-solution transport equation~\cite{Newman2004}:
+\begin{equation}
+  \varepsilon_e \pd{c_e}{t} = \pd{}{x}\!\left(D_\text{eff}(c_e,\varepsilon_e)\pd{c_e}{x}\right) + a_s(1-t_+)\frac{j_n}{\mathcal{F}}
+  \label{eq:electrolyte_pde}
+\end{equation}
+where $\varepsilon_e$ is the electrolyte volume fraction (porosity), $D_\text{eff}$ is the effective diffusivity accounting for the Bruggeman tortuosity correction ($D_\text{eff} = D_0 \varepsilon_e^b$, $b=1.5$ in this work), and $t_+$ is the lithium transference number.
+
+The framework stores the \emph{scaled} quantity $\hat{c}_e = \varepsilon_e c_e$ as the state variable (labelled \texttt{electrolyte} in the code), so the PDE in terms of $\hat{c}_e$ is:
+\begin{equation}
+  \pd{\hat{c}_e}{t} = \pd{}{x}\!\left(-D_\text{eff} \pd{}{x}\!\left(\frac{\hat{c}_e}{\varepsilon_e}\right)\right) + S_e(x)
+  \label{eq:electrolyte_state}
+\end{equation}
+where $S_e$ is the source term from intercalation reactions:
+\begin{equation}
+  S_e(x) = \frac{(1-t_+)I_\text{app}}{A \cdot \mathcal{F}} \times
+  \begin{cases}
+    1/L_n & x \in \text{negative electrode}\\
+    0 & x \in \text{separator}\\
+    -1/L_p & x \in \text{positive electrode}
+  \end{cases}
+  \label{eq:electrolyte_source}
+\end{equation}
+
+\subsection{Concentration-Dependent Diffusivity}
+
+Based on the Nyman et al.\ correlation~\cite{Nyman2008} as adopted in Chen2020~\cite{Chen2020}:
+\begin{equation}
+  D_0(c_e) = 8.794\times10^{-11} c_m^2 - 3.972\times10^{-10} c_m + 4.862\times10^{-10} \quad [\si{\meter\squared\per\second}]
+  \label{eq:D0_correlation}
+\end{equation}
+where $c_m = c_e/1000$ (concentration in \si{\mol\per\liter}). The effective diffusivity in each region is:
+\begin{equation}
+  D_\text{eff}(x) = D_0(c_e(x)) \cdot \varepsilon_e(x)^b
+  \label{eq:Deff}
+\end{equation}
+
+\subsection{Boundary Conditions}
+
+No-flux boundary conditions are applied at the current collectors:
+\begin{equation}
+  \pd{c_e}{x}\bigg|_{x=0} = 0, \qquad \pd{c_e}{x}\bigg|_{x=L} = 0
+  \label{eq:electrolyte_bc}
+\end{equation}
+Continuity of concentration and flux is enforced at the electrode/separator interfaces.
+
+\section{Electrochemical Kinetics: Butler--Volmer Equation}
+\label{sec:butler_volmer}
+
+The pore-wall flux at each electrode is governed by Butler--Volmer kinetics~\cite{Newman2004}:
+\begin{equation}
+  j_n = j_0 \left[\exp\!\left(\frac{\alpha_a \mathcal{F} \eta}{\mathcal{R} T}\right) - \exp\!\left(-\frac{\alpha_c \mathcal{F} \eta}{\mathcal{R} T}\right)\right]
+  \label{eq:butler_volmer}
+\end{equation}
+where $\alpha_a = \alpha_c = 0.5$ (symmetric), $\eta = \phi_s - \phi_e - U(c_{s,\text{surf}})$ is the overpotential, and $j_0$ is the exchange current density.
+
+\subsection{Linearised (Arcsinh) Form}
+
+For symmetric kinetics ($\alpha_a = \alpha_c = 0.5$), \cref{eq:butler_volmer} inverts to give the overpotential explicitly:
+\begin{equation}
+  \eta = \frac{2\mathcal{R}T}{\mathcal{F}} \sinh^{-1}\!\left(\frac{j_n}{2 j_0}\right)
+  \label{eq:bv_arcsinh}
+\end{equation}
+This form (implemented as \texttt{torch.asinh}) is numerically superior to the exponential form for large overpotentials and is used throughout the framework.
+
+\subsection{Exchange Current Density}
+
+The exchange current density~[\si{\ampere\per\meter\squared}] depends on both solid and electrolyte concentrations, and on temperature via an Arrhenius factor:
+\begin{equation}
+  j_0^{(\alpha)} = m_\text{ref}^{(\alpha)} \exp\!\left[\frac{E_{r,\alpha}}{\mathcal{R}}\left(\frac{1}{T_\text{ref}} - \frac{1}{T}\right)\right] \sqrt{c_e} \sqrt{c_{s,\text{surf}}(c_{s,\max} - c_{s,\text{surf}})}
+  \label{eq:j0}
+\end{equation}
+where $\alpha \in \{n, p\}$ and $T_\text{ref} = 298.15$~K. This formulation matches the PyBaMM Chen2020 parameter set~\cite{Chen2020}.
+
+In the framework, the spatially averaged $\sqrt{c_e}$ over each electrode is computed using Clenshaw--Curtis quadrature on the Chebyshev nodes:
+\begin{equation}
+  \langle\sqrt{c_e}\rangle_n = \sum_{k=1}^{N_{x,n}} w_k \sqrt{c_{e,k}}
+  \label{eq:sqrt_ce_avg}
+\end{equation}
+
+\section{Open Circuit Potential (OCP)}
+\label{sec:ocp}
+
+The OCP is an empirical function of the stoichiometry $\theta = c_{s,\text{surf}}/c_{s,\max}$. Based on the Chen2020 parameterisation~\cite{Chen2020}, the following polynomial-hyperbolic fits are implemented:
+
+\subsection{Negative Electrode (Graphite) OCP}
+\begin{align}
+  U_n(\theta_n) &= 1.9793\exp(-39.3631\,\theta_n) + 0.2482 \nonumber\\
+  &\quad - 0.0909\tanh[29.8538(\theta_n - 0.1234)] \nonumber\\
+  &\quad - 0.04478\tanh[14.9159(\theta_n - 0.2769)] \nonumber\\
+  &\quad - 0.0205\tanh[30.4444(\theta_n - 0.6103)]
+  \label{eq:ocp_n}
+\end{align}
+
+\subsection{Positive Electrode (NMC) OCP}
+\begin{align}
+  U_p(\theta_p) &= -0.8090\,\theta_p + 4.4875 \nonumber\\
+  &\quad - 0.0428\tanh[18.5138(\theta_p - 0.5542)] \nonumber\\
+  &\quad - 17.7326\tanh[15.7890(\theta_p - 0.3117)] \nonumber\\
+  &\quad + 17.5842\tanh[15.9308(\theta_p - 0.3120)]
+  \label{eq:ocp_p}
+\end{align}
+
+The cell open circuit voltage is then $\text{OCV} = U_p(\theta_p) - U_n(\theta_n)$.
+
+\section{Cell Terminal Voltage}
+\label{sec:terminal_voltage}
+
+The terminal voltage of each cell is the OCV minus all internal losses:
+\begin{equation}
+  V_\text{cell} = \underbrace{U_p - U_n}_{\text{OCV}}
+    - \underbrace{\eta_n - \eta_p}_{V_\text{rxn}}
+    - \underbrace{I_\text{app}(R_\text{solid} + R_\text{elec} + R_\text{SEI} + R_\text{contact} + R_\text{bus})}_{V_\text{ohm}}
+    - \underbrace{V_\text{conc}}_{\text{concentration overpotential}}
+  \label{eq:terminal_voltage}
+\end{equation}
+
+\subsection{Ohmic Resistance Terms}
+
+\paragraph{Solid resistance.} The solid-phase resistance (volume-averaged approximation):
+\begin{equation}
+  R_\text{solid} = \frac{L_n}{3 \sigma_n A} + \frac{L_p}{3 \sigma_p A}
+  \label{eq:R_solid}
+\end{equation}
+
+\paragraph{Electrolyte resistance.} The effective electrolyte resistance is computed via harmonic integration of the local ionic conductivity:
+\begin{equation}
+  R_\text{elec} = \frac{1}{A \kappa_\text{eff}} \left[\frac{L_n}{3\,\varepsilon_{e,n}^b} + \frac{L_s}{\varepsilon_{e,s}^b} + \frac{L_p}{3\,\varepsilon_{e,p}^b}\right]
+  \label{eq:R_elec}
+\end{equation}
+where $\kappa_\text{eff} = (L_n + L_s + L_p)/\int_0^L \kappa^{-1}(x)\,dx$ is the effective conductivity, and the integral is evaluated numerically using Clenshaw--Curtis quadrature:
+\begin{equation}
+  \int_0^L \frac{dx}{\kappa(x)} \approx L_n \sum_k \frac{w_k^{(n)}}{\kappa(x_k^{(n)})} + L_s \sum_k \frac{w_k^{(s)}}{\kappa(x_k^{(s)})} + L_p \sum_k \frac{w_k^{(p)}}{\kappa(x_k^{(p)})}
+  \label{eq:int_inv_kappa}
+\end{equation}
+
+The local ionic conductivity is given by the Valoen and Reimers correlation~\cite{Valoen2005}:
+\begin{equation}
+  \kappa(c_e) = 0.1297\,c_m^3 - 2.51\,c_m^{1.5} + 3.329\,c_m \quad [\si{\siemens\per\meter}]
+  \label{eq:kappa_correlation}
+\end{equation}
+
+\paragraph{SEI resistance.}
+\begin{equation}
+  R_\text{SEI} = \frac{L_\text{SEI}}{a_{s,n} \cdot A \cdot L_n \cdot \kappa_\text{SEI}}
+  \label{eq:R_sei}
+\end{equation}
+
+\subsection{Concentration Overpotential}
+
+For a symmetric electrolyte (dilute solution approximation), the concentration overpotential is~\cite{Newman2004}:
+\begin{equation}
+  V_\text{conc} = \frac{2\mathcal{R}T}{\mathcal{F}}(1-t_+)\left[\langle\ln c_e\rangle_n - \langle\ln c_e\rangle_p\right]
+  \label{eq:V_conc}
+\end{equation}
+where $\langle\cdot\rangle_\alpha$ denotes the Clenshaw--Curtis quadrature average over electrode $\alpha$.
+
+\section{Thermal Model}
+\label{sec:thermal_model}
+
+\subsection{Lumped Thermal Energy Balance}
+
+Each cell is treated as a thermally lumped body with a single temperature $T_k$. The energy balance is:
+\begin{equation}
+  \rho C_p V_\text{cell} \ddt{T_k} = Q_\text{gen,k} - Q_\text{cool,k} + Q_\text{cond,k}
+  \label{eq:thermal_ode}
+\end{equation}
+where the three terms on the right represent heat generation, cooling, and inter-cell conduction respectively.
+
+\paragraph{Heat generation.} The total irreversible heat generated by cell $k$ is:
+\begin{equation}
+  Q_\text{gen,k} = I_k \cdot (V_\text{OCV,k} - V_\text{cell,k})
+  \label{eq:Q_gen}
+\end{equation}
+This includes Joule heating, activation overpotential losses, and SEI resistance heating.
+
+\paragraph{Convective cooling.}
+\begin{equation}
+  Q_\text{cool,k} = (hA)_k (T_k - T_\text{amb})
+  \label{eq:Q_cool}
+\end{equation}
+
+\paragraph{Entropic correction (optional).} The extended Bernardi--Carpenter model~\cite{Bernardi1985} adds the reversible entropic heat:
+\begin{equation}
+  Q_\text{rev,k} = I_k T_k \frac{dU}{dT} \approx I_k T_k (-3\times10^{-4}) \quad [\si{\watt}]
+  \label{eq:Q_rev}
+\end{equation}
+
+\subsection{Inter-Cell Thermal Conduction: The Interconnection Matrix}
+\label{ssec:thermal_matrix}
+
+For a pack with $N_\text{cells} = N_s \times N_p$ cells arranged in a rectangular grid, cell-to-cell conduction is modelled through a conductance matrix $\boldsymbol{G} \in \mathbb{R}^{N_\text{cells} \times N_\text{cells}}$. The thermal conductance between adjacent cells is:
+\begin{equation}
+  G_{ij} = \frac{k_\text{contact} \cdot A_\text{contact}}{d_{ij}}
+  \label{eq:Gij}
+\end{equation}
+where $k_\text{contact} = 0.5$~\si{\watt\per\meter\per\kelvin} is the thermal contact conductivity, $A_\text{contact} = 0.005$~\si{\meter\squared} is the contact area, and $d_{ij} = 0.02$~m is the cell pitch. The conductance matrix is symmetric ($G_{ij} = G_{ji}$) and sparse---only nearest neighbours in the $N_s \times N_p$ grid are connected.
+
+The assembly rule is: for cell $(s, p)$ with linear index $k = s \cdot N_p + p$:
+\begin{align}
+  G[k,\, k{+}1] &= G[k{+}1,\, k] = G_\text{val}, \quad p < N_p - 1 \quad\text{(parallel neighbours)} \label{eq:G_parallel}\\
+  G[k,\, k{+}N_p] &= G[k{+}N_p,\, k] = G_\text{val}, \quad s < N_s - 1 \quad\text{(series neighbours)} \label{eq:G_series}
+\end{align}
+
+The net conductive heat exchange for cell $k$ is:
+\begin{equation}
+  Q_\text{cond,k} = \sum_{j \in \mathcal{N}(k)} G_{kj}(T_j - T_k) = \left[\boldsymbol{G}\,\boldsymbol{T} - \text{diag}(\boldsymbol{G}\mathbf{1})\,\boldsymbol{T}\right]_k
+  \label{eq:Q_cond}
+\end{equation}
+In matrix form, the full pack thermal derivative:
+\begin{equation}
+  \ddt{\boldsymbol{T}} = \frac{1}{\boldsymbol{C}_\text{th}}\left[\boldsymbol{Q}_\text{gen} - \boldsymbol{Q}_\text{cool} + \boldsymbol{G}\boldsymbol{T} - \text{diag}\!\left(\boldsymbol{G}\mathbf{1}\right)\boldsymbol{T}\right]
+  \label{eq:thermal_matrix_ode}
+\end{equation}
+where $\boldsymbol{C}_\text{th} \in \mathbb{R}^{N_\text{cells}}$ is the vector of volumetric heat capacities ($C_{\text{th},k} = (\rho C_p V_\text{cell})_k$).
+
+\section{Pack Electrical Network}
+\label{sec:pack_electrical}
+
+\subsection{Kirchhoff Network Formulation}
+
+For a pack with $N_s$ series groups and $N_p$ parallel branches, the current distribution within each series group (row) is governed by Kirchhoff's current law (KCL) and voltage law (KVL). Let $I_{s,p}$ be the current through cell $(s,p)$. For each series row $s$:
+\begin{align}
+  \sum_{p=1}^{N_p} I_{s,p} &= I_\text{pack} \quad\text{(KCL)} \label{eq:kcl}\\
+  V_\text{cell}(I_{s,p}) &= V_\text{row}(t) \quad\forall p \quad\text{(KVL)} \label{eq:kvl}
+\end{align}
+where $V_\text{row}$ is the voltage across the parallel row, which is the same for all cells in that row.
+
+\subsection{Iterative Current Solver}
+
+Substituting the Butler--Volmer relationship, \cref{eq:kvl} becomes implicit in $I_{s,p}$. The framework solves this using a conductance-weighted iteration. Define the dynamic resistance of cell $(s,p)$ at current $I_{s,p}$:
+\begin{align}
+  R_{d,n} &= \frac{2\mathcal{R}T/\mathcal{F}}{\sqrt{I^2 + 4I_{0,n}^2}} \label{eq:Rd_n}\\
+  R_{d,p} &= \frac{2\mathcal{R}T/\mathcal{F}}{\sqrt{I^2 + 4I_{0,p}^2}} \label{eq:Rd_p}\\
+  R_\text{total} &= R_\text{series} + R_{d,n} + R_{d,p} \label{eq:R_total}
+\end{align}
+The effective (linearised) open-circuit voltage is:
+\begin{equation}
+  V_\text{virt}(I) = V_\text{cell}(I) + I \cdot R_\text{total}
+  \label{eq:V_virtual}
+\end{equation}
+The Kirchhoff system then reduces to:
+\begin{equation}
+  V_\text{row} = \frac{\sum_p V_\text{virt,p}/R_{\text{total},p} - I_\text{pack}}{\sum_p 1/R_{\text{total},p}}, \qquad I_{s,p} = \frac{V_\text{virt,p} - V_\text{row}}{R_{\text{total},p}}
+  \label{eq:current_dist_solution}
+\end{equation}
+This is iterated 5 times per timestep to account for the nonlinear Butler--Volmer dynamic resistance. The scheme is implemented in \texttt{solve\_current\_distribution()} in \texttt{main.py}.

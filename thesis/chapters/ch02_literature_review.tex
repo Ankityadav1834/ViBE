@@ -1,0 +1,211 @@
+%% ============================================================
+%%  CHAPTER 2 — LITERATURE REVIEW
+%% ============================================================
+\chapter{Literature Review}
+\label{ch:literature}
+
+\section{Overview}
+\label{sec:lit_overview}
+
+The study of lithium-ion batteries spans electrochemistry, solid mechanics, heat transfer, and systems engineering. This chapter reviews the body of knowledge relevant to the present work, structured around five themes: (i) battery fundamentals and intercalation physics; (ii) electrochemical models of increasing fidelity; (iii) numerical methods for stiff PDE systems; (iv) degradation mechanisms and their mathematical descriptions; and (v) pack-level simulation and battery management literature. For each topic, the review identifies the gap that motivates the contribution of this thesis.
+
+\section{Battery Fundamentals and Intercalation Physics}
+\label{sec:lit_fundamentals}
+
+\subsection{Cell Chemistry and Structure}
+\label{ssec:lit_cell_chemistry}
+
+A lithium-ion cell consists of a porous graphite anode, a porous metal-oxide cathode (NMC, LFP, NCA, etc.), a microporous polyolefin separator, and a liquid electrolyte containing a lithium salt (typically LiPF$_6$ in an organic carbonate solvent). The fundamental energy-storage mechanism is \emph{intercalation}: lithium ions are reversibly inserted into and extracted from the crystalline lattice of both electrode materials during charge and discharge without a phase change~\cite{Goodenough2013,Whittingham2004}.
+
+During discharge, lithium atoms at the graphite anode are oxidised, releasing electrons to the external circuit and lithium ions to the electrolyte. The ions migrate through the separator (driven by the electrochemical potential gradient) to the cathode, where they are reduced and intercalated. This process is governed by Fick's law of diffusion within each solid particle and by the Nernst--Planck equation for combined ionic diffusion and electromigration in the electrolyte~\cite{Newman2004}.
+
+\subsection{The Solid Electrolyte Interphase (SEI)}
+\label{ssec:lit_sei_intro}
+
+The SEI is a nanometre-to-micrometre scale passivation layer that forms spontaneously on the anode surface during the first charge cycle, when the anode potential drops below the reduction potential of the electrolyte ($\sim 0.8$~V vs.\ Li/Li$^+$ for common carbonate solvents)~\cite{Peled1979,Aurbach2000}. The SEI is essential for long-term cyclability---it prevents continued electrolyte reduction---but its growth also causes capacity fade (by consuming active lithium) and power fade (by increasing internal resistance). Understanding and quantifying SEI growth is a central concern of battery ageing research.
+
+\section{Electrochemical Models}
+\label{sec:lit_electrochemical_models}
+
+Battery electrochemical models span a wide range of complexity and fidelity. \Cref{tab:model_comparison} summarises the principal model classes, adapted from the systematic survey by Jokar et al.~\cite{Jokar2016}.
+
+\begin{table}[H]
+\centering
+\caption{Comparison of electrochemical battery model classes.}
+\label{tab:model_comparison}
+\begin{tabular}{p{3.2cm}p{3.5cm}p{3.5cm}p{3.5cm}}
+\toprule
+\textbf{Model} & \textbf{Physical Basis} & \textbf{Strengths} & \textbf{Limitations} \\
+\midrule
+Equivalent Circuit Model (ECM) & RC networks & Fast, real-time, simple & No electrochemical states; empirical \\[4pt]
+Single Particle Model (SPM) & Solid diffusion only & Low DOF count & Neglects electrolyte; invalid at high C-rates \\[4pt]
+SPM with electrolyte (SPMe) & SPM + electrolyte & Better high C-rate fidelity & Still linearised; misses strong gradients \\[4pt]
+Doyle--Fuller--Newman (DFN) & Full porous electrode & Highest fidelity; full-physics & Computationally expensive; stiff PDEs \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Equivalent Circuit Models}
+\label{ssec:ecm}
+
+ECMs represent the cell as a Thévenin or Randles circuit with an OCV source, a series resistance, and one or more RC pairs~\cite{Plett2004}. While convenient for real-time BMS applications, ECMs contain no electrochemical states and cannot predict internal concentration and temperature distributions. Their parameters must be re-fitted as the cell ages, limiting their predictive power for degradation studies.
+
+\subsection{Single Particle Model}
+\label{ssec:spm}
+
+The Single Particle Model~\cite{Doyle1993,Scott1998} assumes uniform current distribution across each electrode and models each electrode as a single spherical particle of average radius $R_s$. The governing equation is:
+\begin{equation}
+  \pd{c_\text{s}}{t} = \frac{D_s}{r^2} \pd{}{r}\left(r^2 \pd{c_\text{s}}{r}\right), \quad 0 < r < R_s
+  \label{eq:spm_solid_diff}
+\end{equation}
+with boundary condition at the surface:
+\begin{equation}
+  -D_s \pd{c_\text{s}}{r}\bigg|_{r=R_s} = \frac{j_\text{tot}}{a_s \mathcal{F}}
+  \label{eq:spm_bc}
+\end{equation}
+The SPM fails at C-rates above $\sim 1C$ because electrolyte concentration gradients become significant~\cite{Moura2017}.
+
+\subsection{DFN Porous Electrode Model}
+\label{ssec:dfn}
+
+The DFN model~\cite{Doyle1993,Fuller1994} is the de-facto standard for high-fidelity cell simulation. It models both electrodes as porous media with distributed solid particles, coupled to a continuous electrolyte phase. The model solves for:
+\begin{itemize}
+  \item Solid-phase lithium concentration $c_\text{s}(r,x,t)$ via Fick diffusion in spherical coordinates
+  \item Electrolyte concentration $c_\text{e}(x,t)$ via the dilute solution Nernst--Planck equation
+  \item Solid-phase potential $\phi_\text{s}(x,t)$ via Ohm's law with Butler--Volmer source
+  \item Electrolyte potential $\phi_\text{e}(x,t)$ via the ionic current equation
+\end{itemize}
+The full DFN equations are derived in \cref{ch:math_model}. Comparative validation against experimental discharge data for various cell chemistries is available in~\cite{Doyle1996,Legrand2014}.
+
+\subsection{Reduced-Order DFN Models}
+\label{ssec:reduced_dfn}
+
+The computational cost of the full DFN model has motivated extensive work on reduced-order models (ROMs)~\cite{Moura2017,DiDomenico2010,Cai2011}. Projection-based methods (proper orthogonal decomposition, Galerkin projection) achieve order-of-magnitude speedups but require problem-specific basis construction. For pack-level simulation with heterogeneous parameters---where each cell has distinct physics---ROMs constructed on nominal parameters may fail to capture cell-to-cell variation. The present work takes a different approach: rather than reducing the model order, it accelerates the full model through GPU parallelism.
+
+\section{Numerical Methods for Battery PDEs}
+\label{sec:lit_numerics}
+
+\subsection{Finite Difference Methods}
+\label{ssec:lit_fdm}
+
+Finite difference discretisation of the solid diffusion equation in spherical coordinates is the most common approach in the literature~\cite{Doyle1993}. The standard second-order central-difference scheme for the 1D spherical Laplacian is:
+\begin{equation}
+  \left.\frac{1}{r^2}\pd{}{r}\left(r^2 \pd{c_s}{r}\right)\right|_{r=r_i} \approx \frac{1}{r_i^2} \frac{r_{i+\frac{1}{2}}^2(c_{i+1}-c_i) - r_{i-\frac{1}{2}}^2(c_i - c_{i-1})}{\Delta r^2}
+  \label{eq:fdm_spherical}
+\end{equation}
+This requires careful treatment at $r=0$ (L'Hôpital's rule or symmetric ghost-cell) and delivers only $O(\Delta r^2)$ convergence.
+
+\subsection{Finite Volume Methods}
+\label{ssec:lit_fvm}
+
+The finite volume method is the preferred discretisation for conservation-law equations because it guarantees exact flux conservation at cell interfaces~\cite{LeVeque2002}. For the electrolyte concentration PDE, the FVM naturally handles the piecewise-constant diffusivity (with Bruggeman tortuosity correction) across electrode/separator interfaces through harmonic averaging~\cite{Torchio2016}. PyBaMM~\cite{Sulzer2021} uses FVM for the through-cell electrolyte equations, which is adopted in the present work.
+
+\subsection{Chebyshev Spectral Collocation}
+\label{ssec:lit_chebyshev}
+
+Spectral collocation methods achieve exponential (``infinite order'') convergence for smooth problems~\cite{Trefethen2000,Canuto2006}. For solid particle diffusion, which has a smooth radial profile at practical C-rates, Chebyshev--Gauss--Lobatto (CGL) nodes cluster near the surface (high flux region) and provide spectral accuracy with far fewer degrees of freedom than FDM. The barycentric form of the Chebyshev differentiation matrix, as derived by Trefethen~\cite{Trefethen2000}, is:
+\begin{equation}
+  D_{ij} = \frac{w_j / w_i}{x_i - x_j}, \quad i \neq j; \qquad D_{ii} = -\sum_{j \neq i} D_{ij}
+  \label{eq:cheb_Dij}
+\end{equation}
+where $w_i$ are the barycentric weights. This is the approach adopted in the present work for solid-phase equations.
+
+\subsection{Implicit vs.\ Explicit Integration}
+\label{ssec:lit_implicit}
+
+The DFN system is stiff: the fastest timescale (electrolyte diffusion, $\tau_e \sim L^2/D_\text{eff} \approx 10$~s) and slowest timescale (solid diffusion, $\tau_s \sim R_s^2/D_s \approx 10^3$~s) differ by two orders of magnitude. Explicit integrators (Euler, Runge--Kutta) would require prohibitively small timesteps to satisfy stability constraints~\cite{Hairer1993}. Implicit methods (Backward Euler, BDF, Crank--Nicolson) are unconditionally stable and permit large timesteps at the cost of solving a nonlinear system per step.
+
+Previous work by Smith and Wang~\cite{Smith2006} and Cai et al.~\cite{Cai2011} demonstrated Backward Euler solutions of the DFN system; the present work extends this to GPU-parallel, batch-vectorised Newton iteration across multi-cell packs.
+
+\section{Degradation Physics}
+\label{sec:lit_degradation}
+
+\subsection{SEI Growth Models}
+\label{ssec:lit_sei_models}
+
+The literature contains a rich taxonomy of SEI growth mechanisms, often distinguished by the rate-limiting step:
+
+\begin{description}
+  \item[Solvent-diffusion limited (Safari 2009)~\cite{Safari2009}:] Solvent molecules must diffuse through the existing SEI to reach the active surface. Growth rate $\propto D_\text{sol} c_\text{sol} / L_\text{SEI}$, giving parabolic ($L_\text{SEI} \propto \sqrt{t}$) long-term thickness growth.
+
+  \item[Reaction limited (Ramadass 2004)~\cite{Ramadass2004}:] The Butler--Volmer electrochemical reduction reaction at the SEI--electrolyte interface is rate-limiting. Growth depends exponentially on overpotential.
+
+  \item[Interstitial-diffusion limited (Ploehn 2004)~\cite{Ploehn2004}:] Interstitial lithium ions diffusing through the SEI crystal lattice control the rate.
+
+  \item[EC-reaction limited (Pinson 2012)~\cite{Pinson2012}:] A combined model accounting for both ethylene carbonate (EC) diffusion through the film and the reaction at the inner surface. This is the model adopted in PyBaMM's Chen2020 parameter set.
+
+  \item[Electron-migration limited (Peled 1979)~\cite{Peled1979}:] Electron conduction through the SEI (which has low but non-zero electronic conductivity) limits the growth rate.
+
+  \item[Tunnelling (Monroe 2017)~\cite{Monroe2017}:] At very thin SEI thicknesses, quantum tunnelling of electrons through the film is rate-controlling, giving an exponentially self-limiting growth rate.
+\end{description}
+
+Most studies implement only one or two of these mechanisms. The present framework implements all seven in a unified plug-and-play registry, enabling direct comparison within identical simulation conditions.
+
+\subsection{Lithium Plating}
+\label{ssec:lit_li_plating}
+
+Lithium plating on the graphite anode occurs when the local anode potential drops below 0~V vs.\ Li/Li$^+$. This is favoured by high charging rates (high C-rate), low temperatures, and high SOC~\cite{Legrand2014,Persson2010}. Plated lithium can be irreversible (forming ``dead'' lithium) or reversible (re-intercalating on discharge). Yang et al.~\cite{Yang2017} showed that the stripping kinetics are significantly different from the deposition kinetics, motivating an asymmetric Butler--Volmer model.
+
+\subsection{Mechanical Stress and Particle Cracking}
+\label{ssec:lit_mechanics}
+
+Cyclical intercalation creates diffusion-induced stress (DIS) within electrode particles~\cite{Christensen2006,Garcia2005}. The concentration gradient between the particle surface and bulk creates a biaxial stress state; the surface is typically in compression during lithiation and tension during delithiation. The von Mises stress is:
+\begin{equation}
+  \sigma_\text{VM} = \frac{E \Omega}{3(1-\nu)} \left|2(c_\text{bar} - c_s) \right|
+  \label{eq:vm_stress_lit}
+\end{equation}
+When the surface tensile stress exceeds the fracture toughness criterion $\sigma_\text{crack} = K_{Ic}/\sqrt{\pi L_\text{SEI}}$, SEI cracks form, exposing fresh graphite surface to electrolyte and accelerating SEI growth~\cite{Reniers2019,Zhao2011}.
+
+\section{Pack-Level Simulation and Heterogeneity}
+\label{sec:lit_pack}
+
+\subsection{Electrical Heterogeneity}
+\label{ssec:lit_electrical_hetero}
+
+Gogoana et al.~\cite{Gogoana2014} demonstrated experimentally that even a 20\% mismatch in cell internal resistance within a parallel-connected string causes significant current imbalance, with the lower-resistance cell carrying disproportionately more current and exhibiting accelerated capacity fade. Baumhofer et al.~\cite{Baumhofer2014} showed that cell-to-cell capacity variations within a module increase monotonically with cycle number, driven by differential SEI growth.
+
+\subsection{Thermal Heterogeneity}
+\label{ssec:lit_thermal_hetero}
+
+Non-uniform temperature distributions within battery packs arise from position-dependent heat transfer to the cooling system, and from the Joule heating heterogeneity itself~\cite{Pesaran2001,Zhang2006}. Cells at the pack centre, with less access to cooling, run hotter and age faster, creating a thermal-electrochemical feedback loop. Richardson et al.~\cite{Richardson2014} developed analytical expressions for the thermal gradient in a pack under uniform cooling, showing that the gradient scales with the product of the cell spacing and thermal conductance.
+
+\subsection{Current Distribution in Parallel Strings}
+\label{ssec:lit_current_dist}
+
+The current distribution in a parallel-connected string depends on each cell's voltage-current characteristic. For cells with nonlinear Butler--Volmer kinetics, the current distribution is itself state-dependent and must be solved iteratively. Kim and Shin~\cite{Kim2011} formulated this as a Kirchhoff network problem, which is the approach generalised in the present work.
+
+\subsection{Pack-Scale Simulation Frameworks}
+\label{ssec:lit_pack_frameworks}
+
+Two classes of open-source tools have emerged for pack-scale battery simulation. The first class uses equivalent-circuit models (ECMs) for the cell physics and couples them to a circuit solver for the inter-cell electrical network. Tools such as MATLAB Simscape and custom SPICE decks fall in this category; they are fast but provide no access to internal electrochemical states.
+
+The second class couples a physics-based single-cell model with a circuit network. \textbf{liionpack}~\cite{Tranter2022}, published alongside PyBaMM~\cite{Sulzer2021}, is the most prominent open-source representative of this class. It solves the pack electrical network using \textbf{Modified Nodal Analysis (MNA)}~\cite{Ho1975}, the same sparse-linear formulation used in circuit simulators such as SPICE. The MNA system is assembled into a sparse linear matrix equation $\mathbf{A}\mathbf{x} = \mathbf{z}$ and solved with \texttt{scipy.sparse.linalg.spsolve} at each timestep.
+
+The pack netlist in liionpack consists of four element types: busbar resistors $R_b$ (default $10^{-4}$~$\Omega$), interconnection resistors $R_c$ (default $10^{-2}$~$\Omega$), terminal resistors $R_t$ (default $10^{-5}$~$\Omega$), and voltage sources representing each cell. The cell is modelled as a time-varying voltage source $V_k(t) = V_\text{OCV,k}(t) + R_{i,k} I_k(t)$, where $V_\text{OCV,k}$ and $R_{i,k}$ are supplied by a PyBaMM model (SPM, SPMe, or DFN) at each step. This linearisation is exact for the \emph{external circuit} (busbars and connections) but approximates the cell's nonlinear Butler--Volmer kinetics with a linearised resistance. In particular, the exchange current $I_{0,k}$ does not appear explicitly in the current distribution solve---it is absorbed into $R_{i,k}$ from the PyBaMM solution at the previous step.
+
+A key architectural strength of liionpack is its \textbf{positional busbar model}: each busbar segment is an independent resistor in the netlist. This captures the asymmetry between cells near the terminal and cells at the far end of the busbar row, which can cause current non-uniformity of up to 20\% in wide parallel strings~\cite{Tranter2022}.
+
+An important practical distinction is liionpack's \textbf{selective output system}: the user specifies an \texttt{output\_variables} list (e.g.~\texttt{["Voltage [V]", "Temperature [K]"]}) and only those quantities are stored during simulation. This avoids writing the full state history to disk, dramatically reducing post-processing overhead for long multi-cycle studies. The present framework adopts the same paradigm through the \texttt{OutputSpec} interface (\cref{ch:arch}).
+
+A limitation of the liionpack approach is that it requires the PyBaMM electrochemical model to be re-evaluated at each timestep to obtain an updated $V_\text{OCV}$ and $R_i$, and the current distribution is then solved as a linear system for that frozen cell state. The coupling between the internal electrochemical state and the current distribution therefore lags by one timestep. In contrast, the \VIBE{} framework evaluates Butler--Volmer kinetics \emph{inside} the current distribution iteration at the \emph{current} state, giving a tightly-coupled, nonlinear solve at the cost of not modelling busbar positional asymmetry.
+
+\subsection{Battery Management and Balancing}
+\label{ssec:lit_bms}
+
+Passive balancing dissipates excess energy in resistor networks (bleed resistors) to equalise cell voltages during charging~\cite{Daowd2011}. Active balancing transfers energy between cells using capacitors or inductors, achieving higher efficiency but at greater complexity~\cite{Baughman2008}. The vast majority of balancing algorithm studies use ECM simulations~\cite{Ouyang2018,Zheng2014}. Only a handful of studies have evaluated balancing strategies using physics-based electrochemical models~\cite{Perez2016}, and none of the open-source frameworks reviewed provide a direct coupling between DFN-class physics and BMS algorithm evaluation.
+
+\section{Summary of Literature Gaps}
+\label{sec:lit_summary}
+
+Based on the foregoing review, the following gaps motivate the present work:
+
+\begin{enumerate}
+  \item \textbf{Modular discretisation:} No framework offers runtime-interchangeable FDM/FVM/spectral discretisation on the same PDE system.
+  \item \textbf{Pack scalability:} DFN-resolution pack simulation has not been demonstrated beyond $\sim 20$ cells in an open framework.
+  \item \textbf{Nonlinear pack coupling:} Existing circuit-based frameworks (e.g.\ liionpack~\cite{Tranter2022}) linearise the cell as a voltage source with a fixed internal resistance for each circuit solve. The Butler--Volmer exchange current $I_0$---which depends on the current SOC, electrolyte concentration, and temperature---therefore does not feed back into the current distribution at the same timestep. This introduces an $O(\Delta t)$ kinetic error in the current distribution that grows at high C-rates where Butler--Volmer nonlinearity is most pronounced.
+  \item \textbf{Degradation model comparison:} No single framework supports side-by-side comparison of more than two SEI mechanisms within the same solver.
+  \item \textbf{Physics-based balancing evaluation:} Balancing algorithm studies universally use ECM or SPM physics.
+  \item \textbf{GPU acceleration:} No open battery simulation framework leverages GPU vectorised automatic differentiation for Jacobian computation.
+\end{enumerate}
+
+The present thesis addresses each of these gaps through the \VIBE{} framework described in the following chapters.
