@@ -38,17 +38,21 @@ Designed for researchers studying electrochemical degradation, pack heterogeneit
 
 ---
 
-## 1. What is VIBE?
+## 1. What is ViBE?
 
-VIBE solves the **Doyle–Fuller–Newman (DFN)** electrochemical model for multi-cell battery packs using a fully implicit Newton–Raphson solver with adaptive time-stepping. The solver is built on PyTorch, enabling automatic differentiation for sensitivity analysis and optional GPU acceleration for large pack simulations.
+**ViBE** (**Vi**rtual **B**attery **E**nvironment) is a modular, GPU-accelerated Python framework for high-fidelity, coupled electrochemical–thermal–degradation simulation of large-scale heterogeneous battery packs.
 
-### Core Physics
+While traditional battery simulators rely on explicit solvers that struggle to scale, ViBE solves the **Doyle–Fuller–Newman (DFN)** equations alongside thermal and degradation models using a fully implicit Backward-Euler Newton–Raphson solver with adaptive time-stepping. 
 
-- **Solid diffusion** in anode and cathode particles (Chebyshev pseudospectral)
-- **Electrolyte transport** (Finite Volume or Chebyshev; through-cell PDE)
-- **Butler–Volmer kinetics** with temperature-dependent exchange current density
-- **SEI growth and capacity fade** (7 mechanistic models)
-- **Thermal model** with Joule + entropic heat, convective/liquid/PCM cooling
+Built entirely on PyTorch, ViBE leverages batched tensor operations (`torch.vmap`) to parallelise multi-cell pack simulations across CPUs and GPUs. Furthermore, its fully differentiable architecture enables **exact local differential sensitivity analysis** (e.g., computing the exact gradient of temperature with respect to initial state-of-charge) directly through reverse-mode automatic differentiation (`torch.func.jacrev`), completely eliminating the truncation errors and massive computational overhead of traditional finite-difference methods.
+
+### Core Capabilities & Physics
+
+- **Modular PDE Framework**: Define conservation-law PDEs via an abstract syntax tree (AST) with interchangeable discretisations (Finite Volume or Chebyshev spectral collocation).
+- **GPU-Accelerated Pack Scalability**: A generalised Kirchhoff-network solver tightly coupled to per-cell DFN physics.
+- **Coupled Degradation**: A plug-and-play registry of 7 mechanistically distinct SEI growth models (solvent-diffusion limited, reaction limited, tunneling, etc.).
+- **Thermal Heterogeneity**: Local Joule and entropic heat generation coupled with ambient convective, active liquid, or phase-change material (PCM) cooling.
+- **Electrochemical**: Solid diffusion in particles, through-cell electrolyte transport, and Butler–Volmer kinetics.
 - **Pack-level current distribution** for multi-cell S×P configurations
 
 ### What makes it different?
@@ -649,87 +653,98 @@ Results will appear in `simulation_result/hetero_<name>/results/`.
 
 ### 6.7 Adding a New Equation to the Physics Model
 
-The state equation system is fully modular. All state variables (solid concentration, electrolyte, SEI thickness, temperature, stress, ...) are registered in `model_registry.py` under `STATE_EQUATIONS`. To add a new PDE:
+The state equation system is fully modular. All state variables (solid concentration, electrolyte, SEI thickness, temperature, mechanical stress) are registered in `model_registry.py` under `STATE_EQUATIONS`. 
 
-#### Step 1: Define the RHS function
+ViBE allows you to declare complex, spatially distributed conservation-law PDEs using its operator framework, which automatically handles boundary conditions and Finite Volume / Chebyshev discretization.
+
+Here is a complex example demonstrating how the **mechanical stress PDE** is implemented across the through-cell domain:
+
+#### Step 1: Define the Flux and Source Terms
+
+First, define how the field diffuses and what generates it. The framework provides the context of the entire cell (concentrations, temperature, SEI growth).
 
 ```python
-# In model_registry.py (or a new file you import there)
+# Define how stress propagates (flux coefficient)
+def stress_flux_coefficient(physics, y_flat, i_app, p, context):
+    options = physics.state_equation_options.get("stress", {})
+    stress = physics.state(y_flat, "stress")
+    diffusivity = torch.ones_like(stress) * float(options.get("diffusivity", 1e-12))
+    
+    # physics.through_cell_flux_coefficient handles the grid mapping automatically
+    return physics.through_cell_flux_coefficient(diffusivity)
 
-def my_species_rhs(physics, y_flat, i_app, p, context):
-    """
-    Compute dC_my/dt for a new species.
-
-    Available in context:
-        ce_real      — real electrolyte concentration [mol/m³]
-        dcs_n        — current anode diffusion RHS
-        dLsei_dt     — SEI growth rate
-        dT_dt        — temperature change rate
-        flux_n/p     — solid surface flux [mol/m²/s]
-    """
-    C_my = physics.state(y_flat, 'my_species')
-    return -1e-4 * C_my   # simple first-order decay example
+# Define what generates stress (source term)
+def stress_source(physics, y_flat, i_app, p, context):
+    options = physics.state_equation_options.get("stress", {})
+    stress = physics.state(y_flat, "stress")
+    
+    # Example: stress is generated by SEI growth and solid concentration gradients
+    dlsei_dt = context.get('dLsei_dt', torch.zeros(physics.n_cells, 1, device=physics.device))
+    coupling = float(options.get("coupling", 1.0))
+    relaxation = float(options.get("relaxation", 1e-4))
+    
+    # The framework automatically broadcasts scalar SEI growth to the spatial grid
+    source = coupling * dlsei_dt.expand_as(stress) - relaxation * stress
+    return source
 ```
 
-#### Step 2: Register in `STATE_EQUATIONS`
+#### Step 2: Register the PDE with Boundary Conditions
+
+Use the `through_cell_diffusion_operator` to automatically generate the Jacobian-compatible RHS, including complex boundary conditions (like enforcing a specific force at the current collectors).
 
 ```python
-# In model_registry.py, add to STATE_EQUATIONS dict:
+from pde_framework import through_cell_diffusion_operator, BoundaryCondition
 
 STATE_EQUATIONS = {
     # ... existing entries ...
 
-    "my_species": StateEquationSpec(
-        order=500,              # controls position in state vector (must be unique)
-        size=1,                 # scalar state per cell
-        initial=100.0,          # initial value (can be a string key from params)
-        scale=100.0,            # Newton scaling factor (typical magnitude)
-        nonnegative=True,       # clamp to ≥ 0 during solve
-        rhs=my_species_rhs,     # callable defined above
-        equation="dC/dt = -k * C",  # documentation string
-        notes="Example first-order decay species."
+    "stress": StateEquationSpec(
+        order=450,                             # Defines position in the state vector
+        size=physics_attr("Nel"),              # Same spatial resolution as the electrolyte
+        initial=lambda physics, config: config.get("stress_options", {}).get("initial", 0.0),
+        scale=lambda physics, config: config.get("stress_options", {}).get("scale", 1e6),
+        nonnegative=False,
+        
+        # The operator automatically builds the PDE: dS/dt = ∇·(D ∇S) + Source
+        operator=through_cell_diffusion_operator(
+            "stress",
+            parameters={
+                "flux_coefficient": stress_flux_coefficient,
+                "source": stress_source,
+            },
+            # Enforce Neumann (flux) BC at the negative current collector
+            left_bc=BoundaryCondition(
+                type="neumann", 
+                value=lambda p, y, i, par, ctx: par["stress_options"].get("force_area", 0.0)
+            ),
+            # Enforce Dirichlet (fixed value) BC at the positive current collector
+            right_bc=BoundaryCondition(type="dirichlet", value=0.0)
+        ),
+        
+        # Toggleable via sim_config.py
+        enabled=lambda config: config.get("stress_options", {}).get("enabled", False),
+        options_key="stress_options",
+        equation="∂σ/∂t = ∇·(D ∇σ) + k(dLsei/dt) - λσ",
+        notes="Mechanical stress propagation model across the cell."
     ),
 }
 ```
 
-#### Step 3: Add initial value to `params.json` if needed
+#### Step 3: Enable in Configuration
 
-```json
-{
-  "my_species_0": 100.0
-}
-```
+You can now toggle and tune this complex PDE directly from your configuration dictionary without touching the solver loop:
 
-And use `initial="my_species_0"` in the `StateEquationSpec`.
-
-#### Step 4: Add an operator PDE (for spatial PDEs)
-
-If your state is a spatial field (e.g., a stress wave across the electrode), use the operator system:
-
-```python
-"my_field": StateEquationSpec(
-    order=450,
-    size=physics_attr("Nel"),     # same size as electrolyte
-    initial=0.0,
-    scale=1e6,
-    nonnegative=False,
-    operator=through_cell_diffusion_operator(
-        "my_field",
-        parameters={
-            "flux_coefficient": my_flux_coefficient_fn,
-            "source": my_source_fn,
-        }
-    ),
-    enabled=lambda config: config.get("my_options", {}).get("enabled", False),
-    options_key="my_options",
-)
-```
-
-Enable it in config:
 ```python
 config = {
     ...
-    'my_options': {'enabled': True}
+    'stress_options': {
+        'enabled': True,
+        'diffusivity': 1e-12,
+        'relaxation': 1e-4,
+        'coupling': 1.0,
+        'force_area': 0.1027,
+        'scale': 1e6,           # Newton scaling hint
+    }
 }
 ```
 
