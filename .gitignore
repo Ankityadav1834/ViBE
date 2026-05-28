@@ -1,6 +1,11 @@
 
-# Ignore simulation results and CSVs
+# Ignore simulation results and output CSVs
 *.csv
 simulation_result/
 __pycache__/
 *.pyc
+*.pyo
+.DS_Store
+
+# But DO track chemistry parameter CSV files
+!parameters/**/*.csv
