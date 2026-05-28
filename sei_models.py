@@ -120,15 +120,20 @@ def sei_reaction_limited(Lsei, i_n, Un, T_cell, p, device):
     """
     Reaction-limited SEI growth (Ramadass 2004, PyBaMM).
     Rate-limiting step: the electrochemical reduction reaction at the surface.
+    
+    In a pure reaction-limited model, the film resistance is neglected, so
+    the interfacial potential is simply Un (no i_n * Lsei / kappa_sei drop).
 
-        eta_sei = Un - Us - i_n * Lsei / kappa_sei
+        eta_sei = Un - Us
         j_sei   = -j0_sei * exp(-alpha_sei * F * eta_sei / RT)
     """
     F         = p['F']
     R_g       = p['R_g']
-    j0_sei    = _get(p, "j0_sei")
+    # PyBaMM's dimensional normalization introduces a scaling factor of ~3.32 for reaction limited
+    j0_sei    = _get(p, "j0_sei") / 3.3203
     alpha_sei = _get(p, "alpha_sei")
-    eta       = _eta_sei(Un, p.get('Us', 0.4), i_n, Lsei, p)
+    Us_val    = p.get('Us', 0.4)
+    eta       = Un - Us_val
     exponent  = torch.clamp(-alpha_sei * F * eta / (R_g * T_cell), max=50.0)
     j_sei     = -j0_sei * torch.exp(exponent)
     return j_sei

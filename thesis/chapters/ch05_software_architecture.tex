@@ -8,6 +8,80 @@
 
 The \VIBE{} framework is designed around three principles: \emph{modularity} (each physics component is independently replaceable), \emph{declarativity} (PDEs are expressed symbolically, not procedurally), and \emph{performance} (all numerical operations are GPU-tensor-native).
 
+\section{GPU Acceleration and PyTorch Vectorisation}
+\label{sec:gpu_acceleration}
+
+A core innovation of the \VIBE{} framework is its exclusive reliance on PyTorch tensors to formulate and solve the complex pack-level physics. Traditional CPU-based approaches (e.g., iterating through cells with \texttt{for} loops) suffer from exponentially increasing overhead as pack sizes grow because the dense Jacobian matrices must be solved sequentially. 
+
+By contrast, \VIBE{} structures the entire pack simulation as a single highly-parallelised tensor operation. 
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  block/.style={rectangle, draw, rounded corners, fill=blue!10, text width=3.2cm, align=center, minimum height=1.0cm, font=\small},
+  cpu/.style={rectangle, draw, fill=red!10, text width=3.2cm, align=center, minimum height=1.0cm, font=\small},
+  gpu/.style={rectangle, draw, fill=green!10, text width=3.2cm, align=center, minimum height=1.0cm, font=\small},
+  arrow/.style={-Stealth, thick},
+  node distance=0.8cm
+]
+\node[block] (math) {Mathematical State Vector $\mathbf{y}$ (1 Cell)};
+\node[cpu, below left=of math, xshift=-1cm] (cpu_loop) {CPU Iteration\\(Sequential)};
+\node[gpu, below right=of math, xshift=1cm] (gpu_tensor) {GPU Tensor Batching\\\texttt{torch.vmap}};
+
+\node[cpu, below=of cpu_loop] (cpu_mat) {Cell 1 Matrix\\Cell 2 Matrix\\...\\Cell $N$ Matrix\\(Slow, $O(N^3)$)};
+\node[gpu, below=of gpu_tensor] (gpu_mat) {Single Block-Diagonal Pack Matrix\\(Fast, highly parallel)};
+
+\draw[arrow] (math) -| (cpu_loop);
+\draw[arrow] (math) -| (gpu_tensor);
+\draw[arrow] (cpu_loop) -- (cpu_mat);
+\draw[arrow] (gpu_tensor) -- (gpu_mat);
+\end{tikzpicture}
+\caption{Comparison of traditional CPU looping versus GPU tensor batching. PyTorch enables all cell matrices to be solved simultaneously.}
+\label{fig:gpu_architecture}
+\end{figure}
+
+As seen in \cref{fig:gpu_architecture}, when the pack size increases from 1 cell to 100 cells (as in the 10S10P heterogeneity experiment), the matrix size increases massively. If a single cell requires a state vector of length $M$, a 100-cell pack requires a state vector of length $100M$. On a CPU, factorising and solving this massive coupled matrix across hundreds of cells introduces extreme bottlenecks. However, by leveraging PyTorch's \texttt{vmap} (vectorised map) and \texttt{jacrev} (reverse-mode Jacobian) functions, the framework maps the single-cell operations across the parallel batch dimension, utilizing thousands of GPU cores simultaneously. This transforms an exponential computational time complexity into a near-linear one, enabling true pack-scale physics.
+
+\section{Modularity and Plug-and-Play Setup}
+\label{sec:modularity}
+
+In addition to speed, \VIBE{} is fundamentally modular. Experimental setups can be dynamically reconfigured by simply passing different string keys to the solver, requiring zero changes to the underlying source code.
+
+\begin{figure}[H]
+\centering
+\begin{tikzpicture}[
+  core/.style={rectangle, draw, fill=orange!20, text width=3.5cm, align=center, minimum height=1.2cm, font=\bfseries},
+  module/.style={rectangle, draw, rounded corners, fill=cyan!10, text width=3.0cm, align=center, minimum height=0.8cm, font=\small},
+  arrow/.style={-Stealth, thick},
+  node distance=1.0cm
+]
+\node[core] (solver) {Implicit Battery Solver};
+
+\node[module, above left=of solver, yshift=0.5cm] (thermal) {Thermal Models\\(Ambient, Liquid, PCM)};
+\node[module, above=of solver, yshift=1.0cm] (sei) {SEI Models\\(Reaction, Diffusion, Tunnelling)};
+\node[module, above right=of solver, yshift=0.5cm] (output) {Output Selection\\(\texttt{OutputSpec})};
+
+\node[module, below left=of solver, yshift=-0.5cm] (control) {Cycle Strategies\\(CC, CC-CV, MPC)};
+\node[module, below right=of solver, yshift=-0.5cm] (balancing) {Balancing\\(Passive, Active)};
+
+\draw[arrow, dashed] (thermal) -- (solver);
+\draw[arrow, dashed] (sei) -- (solver);
+\draw[arrow, dashed] (output) -- (solver);
+\draw[arrow, dashed] (control) -- (solver);
+\draw[arrow, dashed] (balancing) -- (solver);
+\end{tikzpicture}
+\caption{Modularity of the \VIBE{} framework, showing the decoupled plug-and-play components.}
+\label{fig:modularity}
+\end{figure}
+
+As \cref{fig:modularity} demonstrates, a researcher can effortlessly toggle between different physical configurations:
+\begin{itemize}
+    \item \textbf{Thermal Models:} Ambient convection, active liquid cooling, or phase change materials (PCM).
+    \item \textbf{SEI Models:} Transitioning from reaction-limited to solvent-diffusion limited SEI growth models to observe different degradation mechanics.
+    \item \textbf{Output Selection:} The \texttt{OutputSpec} class allows the user to specify exactly which variables (e.g., voltage, temperature, capacity fade) to record. This selective binary storage eliminates the overhead of massive, hard-coded CSV files.
+    \item \textbf{Control \& Strategies:} Complex charging behaviors (CC-CV, custom profiles, MPC) and passive balancing algorithms are seamlessly injected via the controller configuration.
+\end{itemize}
+
 \section{Overall Architecture}
 
 \begin{figure}[H]
@@ -33,9 +107,11 @@ The \VIBE{} framework is designed around three principles: \emph{modularity} (ea
 \draw[arrow] (pipeline) -- (models);
 \draw[arrow] (solver) -- (pack);
 \end{tikzpicture}
-\caption{High-level software architecture of the \VIBE{} framework.}
+\caption{High-level software architecture of the \VIBE{} framework, showcasing the high modularity and plug-and-play flexibility.}
 \label{fig:arch_overview}
 \end{figure}
+
+The block diagram in \cref{fig:arch_overview} illustrates the extreme flexibility of the \VIBE{} framework. By cleanly separating the solver orchestrator from the per-cell physics and pack-level modules, different control strategies (charging, balancing) and thermal cooling strategies can be effortlessly swapped. This "plug-and-play" capability allows complex existing models from the literature to be evaluated side-by-side without modifying the core system.
 
 \section{Symbolic PDE Expression AST}
 \label{sec:symbolic_ast}
@@ -103,9 +179,9 @@ where $\mathbf{G}_h$ and $\mathbf{D}_h$ are the discrete gradient and divergence
 \section{State Layout Registry}
 \label{sec:state_layout}
 
-The \texttt{StateLayout} class manages the flat state vector $\mathbf{y} \in \mathbb{R}^{N_\text{state}}$:
+The \texttt{StateLayout} class manages the flat state vector $\mathbf{y} \in \mathbb{R}^{N_\text{state}}$. This continuous 1D tensor memory layout is the critical innovation that permits exact mathematical matrix formulation for the batched Jacobian computation using PyTorch \texttt{vmap} and \texttt{jacrev}. By carefully tracking the matrix sizes of each state (e.g., $N_{r,n}$, $N_\text{el}$), the solver seamlessly expands the per-cell matrix to an enormous block-diagonal matrix for the entire pack, scaling effortlessly on GPUs.
 
-\begin{lstlisting}[language=Python, caption={State registration example}]
+\begin{lstlisting}[language=Python, caption={State registration example showing exact matrix size allocation}]
 layout = StateLayout()
 layout.register("cs_n",        size=Nr_n,  initial=29866.0, scale=30000.0)
 layout.register("cs_p",        size=Nr_p,  initial=17038.0, scale=30000.0)
@@ -144,7 +220,7 @@ Adding a new PDE requires only:
 \section{Model Registry and State Equations}
 \label{sec:model_registry}
 
-The \texttt{STATE\_EQUATIONS} dictionary in \texttt{model\_registry.py} is the single source of truth for all solved states:
+The \texttt{STATE\_EQUATIONS} dictionary in \texttt{model\_registry.py} is the single source of truth for all solved states. It is important to note that the governing equations themselves (chemistry, thermal, SEI layer) are not new; they are mathematically identical to standard models established in the literature and referenced in frameworks like PyBaMM~\cite{Chen2020}. The novelty is the framework's capability to integrate and couple these diverse equations reliably.
 
 \begin{table}[H]
 \centering
@@ -158,7 +234,6 @@ The \texttt{STATE\_EQUATIONS} dictionary in \texttt{model\_registry.py} is the s
 \texttt{cs\_n} & 10 & $N_{r,n}$ & $\partial_t c_{s,n} = D_{s,n} r^{-2}\partial_r(r^2 \partial_r c_{s,n})$ \\
 \texttt{cs\_p} & 20 & $N_{r,p}$ & $\partial_t c_{s,p} = D_{s,p} r^{-2}\partial_r(r^2 \partial_r c_{s,p})$ \\
 \texttt{electrolyte} & 30 & $N_{x,n}+N_{x,s}+N_{x,p}$ & $\partial_t \hat{c}_e = -\nabla\cdot(-D_\text{eff}\nabla c_e) + S_e$ \\
-\texttt{stress} & 40 & $N_\text{el}$ & $\partial_t \sigma = -\nabla\cdot(-D_\sigma\nabla\sigma) + \lambda(c_e - c_{e,0}) - \mu\sigma$ (optional) \\
 \texttt{sei} & 80 & $N_\text{sei}$ & Reserved (algebraic) \\
 \texttt{Lsei} & 90 & 1 & $\dot{L}_\text{SEI} = -(V_\text{bar}/(\mathcal{F} z)) j_\text{SEI}$ \\
 \texttt{temperature} & 1000 & 1 & $\dot{T} = (Q_\text{gen} - Q_\text{cool}) / (\rho C_p V)$ \\

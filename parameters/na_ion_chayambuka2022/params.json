@@ -1,0 +1,62 @@
+{
+  "_description": "Na-ion cell – Chayambuka 2022 parameterization. OCP, Ds, k, De, and sigma_e are loaded from CSV files in this folder.",
+  "_reference": "Chayambuka (2022), J. Power Sources 541 231346",
+
+  "Ln":          6.4e-05,
+  "Ls":          2.5e-05,
+  "Lp":          6.8e-05,
+  "A":           2.54e-04,
+  "Rs_n":        3.48e-06,
+  "Rs_p":        5.9e-07,
+
+  "F":           96485.33,
+  "R_g":         8.314,
+
+  "Ds_n":        1.0e-14,
+  "Ds_p":        1.0e-15,
+  "cs_max_n":    14540.0,
+  "cs_max_p":    15320.0,
+  "cs_n_init":   13520.0,
+  "cs_p_init":   3320.0,
+
+  "as_n":        300000.0,
+  "as_p":        500000.0,
+  "sigma_n":     256.0,
+  "sigma_p":     50.0,
+
+  "eps_e_n":     0.51,
+  "eps_e_s":     0.55,
+  "eps_e_p":     0.23,
+  "t_plus":      0.45,
+  "ce_0":        1000.0,
+  "b":           1.5,
+
+  "m_ref_n":     1.0e-10,
+  "m_ref_p":     1.0e-10,
+  "E_r_n":       25000.0,
+  "E_r_p":       25000.0,
+
+  "kappa_sei":   1.0,
+  "Msei":        0.0,
+  "rho_sei":     1.0,
+  "Us":          0.0,
+  "Lsei_0":      0.0,
+  "sei_enabled": 0.0,
+
+  "Vol_cell":    1.5e-05,
+  "rho_Cp":      1500000.0,
+  "hA":          0.05,
+  "T_amb":       298.15,
+  "T":           298.15,
+
+  "nominal_cap": 0.003,
+  "v_min":       2.0,
+  "v_max":       4.2,
+
+  "R_contact":   0.01,
+  "R_bus":       0.0001,
+
+  "Dsolv":       0.0,
+  "kf":          0.0,
+  "beta":        0.0
+}

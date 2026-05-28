@@ -155,12 +155,47 @@ def stress_source(physics, y_flat, _i_app, p, context):
     return coupling * (ce_state - p["ce_0"]) - relaxation * stress
 
 
-def cs_n_surface_gradient(_physics, _y_flat, _i_app, p, context):
-    return context["flux_n"] / p["Ds_n"]
+def _solid_diffusivity_resolver(state_name):
+    """Returns a resolver that checks physics.fn_Ds_n/fn_Ds_p for CSV-based callable diffusivity."""
+    fn_attr = f'fn_{state_name[3:]}' if state_name.startswith('cs_') else f'fn_{state_name}'
+    # Actually: cs_n → fn_Ds_n, cs_p → fn_Ds_p
+    fn_attr = 'fn_Ds_n' if state_name == 'cs_n' else 'fn_Ds_p'
+    param_key = 'Ds_n' if state_name == 'cs_n' else 'Ds_p'
+
+    def resolver(physics, y_flat, _i_app, p, _context):
+        fn = getattr(physics, fn_attr, None)
+        if fn is not None:
+            # Compute Ds at the surface stoichiometry
+            cs = physics.state(y_flat, state_name)
+            cs_max = p['cs_max_n'] if state_name == 'cs_n' else p['cs_max_p']
+            sto = cs[-1] / cs_max
+            return fn(sto, p.get('T', 298.15))
+        return p[param_key]
+
+    return resolver
 
 
-def cs_p_surface_gradient(_physics, _y_flat, _i_app, p, context):
-    return context["flux_p"] / p["Ds_p"]
+def cs_n_surface_gradient(physics, _y_flat, _i_app, p, context):
+    fn_Ds_n = getattr(physics, 'fn_Ds_n', None)
+    if fn_Ds_n is not None:
+        cs_n = physics.state(_y_flat, 'cs_n')
+        sto = cs_n[-1] / p['cs_max_n']
+        Ds_n_val = fn_Ds_n(sto, p.get('T', 298.15))
+    else:
+        Ds_n_val = p['Ds_n']
+    return context['flux_n'] / Ds_n_val
+
+
+def cs_p_surface_gradient(physics, _y_flat, _i_app, p, context):
+    fn_Ds_p = getattr(physics, 'fn_Ds_p', None)
+    if fn_Ds_p is not None:
+        cs_p = physics.state(_y_flat, 'cs_p')
+        sto = cs_p[-1] / p['cs_max_p']
+        Ds_p_val = fn_Ds_p(sto, p.get('T', 298.15))
+    else:
+        Ds_p_val = p['Ds_p']
+    return context['flux_p'] / Ds_p_val
+
 
 
 def sei_rhs(physics, y_flat, _i_app, _p, _context):
@@ -177,11 +212,11 @@ def temperature_rhs(_physics, _y_flat, _i_app, _p, context):
 
 def spherical_particle_operator(state_name, domain):
     if state_name == "cs_n":
-        diffusivity = parameter_item("Ds_n")
+        diffusivity = _solid_diffusivity_resolver("cs_n")
         radius = parameter_item("Rs_n")
         surface_value = cs_n_surface_gradient
     elif state_name == "cs_p":
-        diffusivity = parameter_item("Ds_p")
+        diffusivity = _solid_diffusivity_resolver("cs_p")
         radius = parameter_item("Rs_p")
         surface_value = cs_p_surface_gradient
     else:

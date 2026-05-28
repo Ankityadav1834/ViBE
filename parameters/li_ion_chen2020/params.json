@@ -1,0 +1,62 @@
+{
+  "_description": "LG M50 Li-ion cell – Chen 2020 parameterization (all parameters explicit / hardcoded, no CSV lookup needed for this chemistry)",
+  "_reference": "Chen (2020), J. Electrochem. Soc. 167 080534",
+
+  "Ln":          8.52e-05,
+  "Ls":          1.20e-05,
+  "Lp":          7.56e-05,
+  "A":           0.1027,
+  "Rs_n":        5.86e-06,
+  "Rs_p":        5.22e-06,
+
+  "F":           96485.33,
+  "R_g":         8.314,
+
+  "Ds_n":        3.3e-14,
+  "Ds_p":        4.0e-15,
+  "cs_max_n":    33133.0,
+  "cs_max_p":    63104.0,
+  "cs_n_init":   29866.0,
+  "cs_p_init":   17038.0,
+
+  "as_n":        383000.0,
+  "as_p":        382000.0,
+  "sigma_n":     215.0,
+  "sigma_p":     0.18,
+
+  "eps_e_n":     0.25,
+  "eps_e_s":     0.47,
+  "eps_e_p":     0.335,
+  "t_plus":      0.2594,
+  "ce_0":        1000.0,
+  "b":           1.5,
+
+  "m_ref_n":     6.48e-07,
+  "m_ref_p":     3.42e-06,
+  "E_r_n":       35000.0,
+  "E_r_p":       17800.0,
+
+  "kappa_sei":   5e-06,
+  "Msei":        0.162,
+  "rho_sei":     1690.0,
+  "Us":          0.4,
+  "Lsei_0":      5e-09,
+  "sei_enabled": 1.0,
+
+  "Vol_cell":    2.42e-05,
+  "rho_Cp":      1767600.0,
+  "hA":          0.0531,
+  "T_amb":       298.15,
+  "T":           298.15,
+
+  "nominal_cap": 5.0,
+  "v_min":       2.5,
+  "v_max":       4.2,
+
+  "R_contact":   0.01,
+  "R_bus":       0.0001,
+
+  "Dsolv":       0.0,
+  "kf":          0.0,
+  "beta":        0.0
+}

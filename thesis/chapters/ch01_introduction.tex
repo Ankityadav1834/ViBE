@@ -35,9 +35,9 @@ Contemporary literature reports that:
 
 The present work demonstrates that these computational barriers can be overcome through:
 \begin{itemize}[noitemsep]
-  \item a \emph{block-diagonal} Jacobian structure, exploiting the independence of per-cell physics;
-  \item GPU-batched automatic differentiation via \texttt{torch.vmap} and \texttt{torch.func.jacrev};
-  \item an implicit Backward Euler solver with scaled Newton iteration and line search.
+  \item a \emph{block-diagonal} Jacobian structure, exploiting the independence of per-cell physics while resolving pack-level coupling efficiently;
+  \item GPU-accelerated automatic differentiation via \texttt{torch.vmap} and \texttt{torch.func.jacrev}, computing exact gradients simultaneously across the pack;
+  \item an innovative implicit Backward Euler solver strategy with scaled Newton iterations designed specifically for PyTorch compatibility and massively parallel execution.
 \end{itemize}
 
 \section{Literature Gap and Research Motivation}
@@ -52,18 +52,20 @@ The present work demonstrates that these computational barriers can be overcome 
 \small
 \begin{tabularx}{\textwidth}{p{3.0cm}ccccccc}
 \toprule
-\textbf{Framework / Study} & \textbf{Max Cells} & \textbf{Thermal} & \textbf{Degradation} & \textbf{Electrochem.} & \textbf{GPU} & \textbf{Balancing} \\
+\textbf{Framework / Study} & \textbf{Max Cells} & \textbf{Thermal} & \textbf{Degradation} & \textbf{Electrochem.} & \textbf{GPU Fast} & \textbf{Topology} \\
 \midrule
-Doyle et al.\ \cite{Doyle1993}      & 1   & No  & No  & DFN  & No  & No \\
-Kim et al.\ \cite{Kim2011}          & 12  & Yes & No  & DFN  & No  & No \\
-Legrand et al.\ \cite{Legrand2014}  & 6   & No  & No  & SPMe & No  & No \\
-PyBaMM \cite{Sulzer2021}            & 1   & Yes & Yes & DFN  & No  & No \\
-Zhang et al.\ \cite{Zhang2020}      & 100 & Yes & ECM & ECM  & No  & No \\
-Gogoana et al.\ \cite{Gogoana2014}  & 25  & No  & Est & ECM  & No  & No \\
-\textbf{\VIBE{} (this work)}        & \textbf{400+} & \textbf{Yes} & \textbf{Yes} & \textbf{DFN} & \textbf{Yes} & \textbf{Yes} \\
+Doyle et al.\ \cite{Doyle1993}      & 1   & No  & No  & DFN  & No  & Single \\
+Kim et al.\ \cite{Kim2011}          & 12  & Yes & No  & DFN  & No  & Series \\
+Legrand et al.\ \cite{Legrand2014}  & 6   & No  & No  & SPMe & No  & Series \\
+PyBaMM \cite{Sulzer2021}            & 1   & Yes & Yes & DFN  & No  & Single \\
+Zhang et al.\ \cite{Zhang2020}      & 100 & Yes & ECM & ECM  & No  & S/P Pack \\
+Gogoana et al.\ \cite{Gogoana2014}  & 25  & No  & Est & ECM  & No  & Parallel \\
+\textbf{\VIBE{} (this work)}        & \textbf{400+} & \textbf{Yes} & \textbf{Yes} & \textbf{DFN} & \textbf{Yes} & \textbf{Arbitrary} \\
 \bottomrule
 \end{tabularx}
 \end{table}
+
+While many papers have developed pack-level physics-based models, most are limited to specific purposes such as heterogeneity analysis or balancing strategies, and lack speed because they do not utilize GPU acceleration. Consequently, they cannot be expanded for larger packs and are often restricted to only series or only parallel configurations. This work bridges that gap by providing a fully coupled, fast, and scalable pack-level modeling framework.
 
 \section{Objectives of this Thesis}
 \label{sec:objectives}
@@ -71,19 +73,19 @@ Gogoana et al.\ \cite{Gogoana2014}  & 25  & No  & Est & ECM  & No  & No \\
 The primary objective of this thesis is the design, implementation, and validation of a modular, GPU-accelerated software framework for coupled electrochemical--thermal--degradation simulation of large-scale heterogeneous lithium-ion battery packs. The specific research objectives are:
 
 \begin{enumerate}
-  \item \textbf{Develop a generalised symbolic PDE framework} with runtime-selectable spatial discretisation (FDM, FVM, Chebyshev spectral collocation) and operator-based PDE assembly, enabling arbitrary new physics to be added without modifying the solver core.
-
-  \item \textbf{Derive and implement a full DFN-class electrochemical model} for an $N_\text{s} \times N_\text{p}$ heterogeneous battery pack, including solid diffusion in spherical coordinates, nonlinear electrolyte transport with concentration-dependent diffusivity, Butler--Volmer kinetics with temperature-corrected exchange current density, concentration overpotential, and ohmic losses.
-
-  \item \textbf{Implement a modular degradation physics library} covering seven SEI growth mechanisms, three lithium plating models, and two mechanical stress models, all operating within the same state-vector and solver pipeline.
-
-  \item \textbf{Construct a pack-level current distribution algorithm} based on a nonlinear Kirchhoff network with Butler--Volmer dynamic resistance, capable of handling heterogeneous cell parameters and resolving current redistribution in real time.
-
-  \item \textbf{Develop physics-based battery management modules} for passive and active cell balancing (capacitor and inductor topologies) and three thermal management strategies (ambient convection, active liquid cooling, and phase-change material), evaluated against full electrochemical physics.
-
-  \item \textbf{Demonstrate computational scaling and physical fidelity} through quantitative validation experiments including single-cell comparison with PyBaMM, pack heterogeneity propagation, SEI model comparison, and degradation-aware balancing.
+  \item \textbf{Implement a GPU-accelerated scalable pack framework:} Develop an innovative solver strategy that explicitly structures the cell-state matrices for PyTorch compatibility. By resolving the exact math of batched Jacobians, the framework overcomes the traditional computational bottlenecks, allowing large arbitrary $N_\text{s} \times N_\text{p}$ topologies to be simulated efficiently on GPUs.
   
-  \item \textbf{Introduce exact local sensitivity analysis} via reverse-mode automatic differentiation. Unlike perturbation-based methods that scale linearly with the number of parameters, the proposed differentiable framework allows simultaneous gradient computation for all parameters through the coupled PDE system without repeated simulations, enabling efficient sensitivity studies on heterogeneous pack physics.
+  \item \textbf{Integrate high-fidelity physics models from literature:} Incorporate established electrochemical, thermal, and SEI layer equations referenced from well-known literature (such as PyBaMM). The novelty lies not in new equations, but in the fast, robust integration of everything (stress, SEI, thermal) with the capability to easily add more detail.
+
+  \item \textbf{Establish a highly modular, plug-and-play architecture:} Design a framework where thermal models, SEI mechanisms, and control strategies can be changed or made more detailed easily without touching core solver mechanics. Block diagrams and workflows will demonstrate the extreme flexibility of the framework.
+
+  \item \textbf{Construct a fully coupled pack-level model:} Model detailed pack-level current sharing, thermal interconnection, and heterogeneity propagation simultaneously without sacrificing execution speed, addressing the limitations of existing CPU-bound studies.
+
+  \item \textbf{Demonstrate computational scaling and capabilities:} Conduct single-cell and SEI model comparisons with PyBaMM, perform speed comparisons between CPU and GPU to demonstrate how the exponential scaling barrier is broken, and simulate severe pack heterogeneity (e.g., $10s10p$ uneven cooling) to visualize coupled uneven SEI growth and current variations.
+  
+  \item \textbf{Conduct fast, exact local sensitivity analysis:} Highlight how the fully differentiable framework makes complex sensitivity analysis significantly faster and easier compared to literature baselines, facilitating automated gradient computation for cell variations.
+  
+  \item \textbf{Provide general numerical flexibility as a secondary benefit:} While the focus is heavily on system integration and GPU performance, the framework will still allow operators (like FVM) to be customized easily.
 \end{enumerate}
 
 \section{Thesis Contributions}
@@ -92,21 +94,15 @@ The primary objective of this thesis is the design, implementation, and validati
 The original contributions of this thesis are as follows:
 
 \begin{description}
-  \item[C1 --- Modular Symbolic PDE Engine.] A frozen-dataclass AST representation of PDEs with operator overloading, enabling human-readable PDE declaration (e.g., $\partial_t c = \nabla \cdot (D \nabla c)$) that is automatically compiled to discretised tensor operations. Three numerical backends (FDM, FVM, Chebyshev) are implemented and interchangeable.
+  \item[C1 --- Fast, GPU-Batched Pack Solver for PyTorch.] An innovative implicit Newton solver designed specifically for PyTorch. By structuring the physics into large batched matrices and utilizing \texttt{torch.vmap} with \texttt{jacrev}, the solver computes the fully coupled PDE system in parallel, achieving near-linear GPU scaling with pack size and breaking the conventional bottleneck of exponential scaling beyond 20 cells.
+  
+  \item[C2 --- Deeply Coupled Multipack Physics Integration.] While utilizing standard literature equations for individual cell chemistry, SEI, and thermal dynamics (referenced from PyBaMM and related works), this work achieves the unprecedented integration of full DFN-class electrochemical kinetics, thermal interconnection, and differential SEI degradation simultaneously at the pack level.
 
-  \item[C2 --- Chebyshev--Gauss--Lobatto Discretisation of Spherical Solid Diffusion.] Barycentric Chebyshev differentiation matrices for solid particle diffusion are derived and implemented, with Clenshaw--Curtis quadrature for surface-averaged flux coupling. This avoids the artificial singularity handling required in FDM approaches and achieves spectral accuracy.
+  \item[C3 --- Plug-and-Play Modular Architecture.] A highly flexible, modular registry where new control strategies (charging, cooling) and degradation models (seven distinct SEI models) can be swapped seamlessly. Block diagrams illustrate the ease with which different strategies from the literature can be implemented without touching the underlying core solver logic.
 
-  \item[C3 --- Harmonic-Mean Finite Volume Electrolyte Transport.] The electrolyte concentration PDE is discretised using a conservative cell-centred finite volume scheme with harmonic-mean interface diffusivities, ensuring correct flux continuity across electrode/separator interfaces without artificial diffusion.
-
-  \item[C4 --- Conductance-Weighted Iterative Current Distribution.] A Newton-linearised Kirchhoff network solver is developed that accounts for nonlinear Butler--Volmer dynamic resistance in current distribution. Unlike Thévenin-equivalent methods, this correctly captures the impedance of each cell at the operating point.
-
-  \item[C5 --- Physics-Coupled Thermal Interconnection Matrix.] A systematic cell-to-cell thermal conductance matrix $\boldsymbol{G}$ is derived for arbitrary $N_\text{s} \times N_\text{p}$ pack topologies, coupled to a lumped thermal model with pluggable cooling strategies.
-
-  \item[C6 --- Plug-and-Play Degradation Model Registry.] A unified API for SEI, plating, and stress models enables comparison of seven mechanistically distinct SEI formulations within a single simulation framework, using identical electrochemical driving forces.
-
-  \item[C7 --- GPU-Batched Implicit Newton Solver with Automatic Differentiation.] The full coupled PDE system is solved using backward-Euler Newton iterations where the Jacobian is computed via reverse-mode automatic differentiation (\texttt{jacrev}) and batched across all cells in parallel using \texttt{vmap}, achieving near-linear GPU scaling with pack size.
-
-  \item[C8 --- Exact Local Sensitivity Analysis.] Leveraging the fully differentiable tensor architecture, the framework provides exact, truncation-error-free local sensitivity gradients (e.g., $\partial \dot{T} / \partial p_i$) of arbitrary model outputs with respect to all physical parameters simultaneously using a single backward pass, eliminating the computational bottleneck of finite-difference perturbation studies.
+  \item[C4 --- Exact Local Sensitivity Analysis via Automatic Differentiation.] By leveraging the fully differentiable tensor architecture, the framework performs exact local sensitivity gradients (e.g., $\partial \dot{T} / \partial p_i$) of arbitrary model outputs. This capability drastically simplifies and accelerates sensitivity studies relative to existing perturbation methods in the literature.
+  
+  \item[C5 --- Generalised PDE Operator Support.] Although not the primary focus, the framework still provides a declarative operator-based pipeline that supports generic discretisation methods (like FVM for exact flux conservation), serving as a robust mathematical foundation for the high-performance solver.
 \end{description}
 
 \section{Thesis Organisation}

@@ -1,16 +1,31 @@
 import torch
 
 def calculate_ocp(physics, stoich, electrode):
+    """
+    Calculate the open-circuit potential for a given electrode.
+
+    If the BatteryPhysics object carries a `chemistry` dict (loaded from a
+    parameter folder), the chemistry's callable OCP functions are used.
+    Otherwise the original Li-ion Chen2020 analytic expressions are used as
+    a fallback so that existing scripts continue to work unchanged.
+    """
     s = torch.clamp(stoich, 0.001, 0.999)
+    chem = getattr(physics, 'chemistry', None)
+    if chem is not None:
+        if electrode == 'anode':
+            return chem['ocp_n'](s)
+        else:
+            return chem['ocp_p'](s)
+    # --- Fallback: Li-ion Chen2020 analytic OCP ---
     if electrode == 'anode':
-        return (1.9793 * torch.exp(-39.3631*s) + 0.2482 - 
-                0.0909 * torch.tanh(29.8538*(s-0.1234)) - 
-                0.04478 * torch.tanh(14.9159*(s-0.2769)) - 
+        return (1.9793 * torch.exp(-39.3631*s) + 0.2482 -
+                0.0909 * torch.tanh(29.8538*(s-0.1234)) -
+                0.04478 * torch.tanh(14.9159*(s-0.2769)) -
                 0.0205 * torch.tanh(30.4444*(s-0.6103)))
     else:
-        return (-0.8090*s + 4.4875 - 
-                0.0428 * torch.tanh(18.5138*(s-0.5542)) - 
-                17.7326 * torch.tanh(15.7890*(s-0.3117)) + 
+        return (-0.8090*s + 4.4875 -
+                0.0428 * torch.tanh(18.5138*(s-0.5542)) -
+                17.7326 * torch.tanh(15.7890*(s-0.3117)) +
                 17.5842 * torch.tanh(15.9308*(s-0.3120)))
 
 def get_circuit_parameters(physics, y_batch):
@@ -56,8 +71,21 @@ def get_circuit_parameters(physics, y_batch):
     sqrt_ce_n = torch.sum(torch.sqrt(torch.clamp(ce_real_batch[:, :physics.Nx_n], min=1e-12)) * W_n_batch, dim=1, keepdim=True)
     sqrt_ce_p = torch.sum(torch.sqrt(torch.clamp(ce_real_batch[:, -physics.Nx_p:], min=1e-12)) * W_p_batch, dim=1, keepdim=True)
 
-    j0_n = p['m_ref_n'] * arr_n * sqrt_ce_n * torch.sqrt(torch.clamp(cs_n[:, -1:] * (p['cs_max_n'] - cs_n[:, -1:]), min=1e-12))
-    j0_p = p['m_ref_p'] * arr_p * sqrt_ce_p * torch.sqrt(torch.clamp(cs_p[:, -1:] * (p['cs_max_p'] - cs_p[:, -1:]), min=1e-12))
+    # Resolve m_ref: use callable if CSV-based chemistry; else tensor from p
+    _fn_m_ref_n = getattr(physics, 'fn_m_ref_n', None)
+    _fn_m_ref_p = getattr(physics, 'fn_m_ref_p', None)
+    if _fn_m_ref_n is not None:
+        m_ref_n_batch = _fn_m_ref_n(cs_n[:, -1:])
+    else:
+        m_ref_n_batch = p['m_ref_n']
+    if _fn_m_ref_p is not None:
+        m_ref_p_batch = _fn_m_ref_p(cs_p[:, -1:])
+    else:
+        m_ref_p_batch = p['m_ref_p']
+
+    j0_n = m_ref_n_batch * arr_n * sqrt_ce_n * torch.sqrt(torch.clamp(cs_n[:, -1:] * (p['cs_max_n'] - cs_n[:, -1:]), min=1e-12))
+    j0_p = m_ref_p_batch * arr_p * sqrt_ce_p * torch.sqrt(torch.clamp(cs_p[:, -1:] * (p['cs_max_p'] - cs_p[:, -1:]), min=1e-12))
+
     
     I0_n = j0_n * p['A'] * p['Ln'] * p['as_n']
     I0_p = j0_p * p['A'] * p['Lp'] * p['as_p']
@@ -112,8 +140,15 @@ def compute_derivatives_functional(physics, y_flat, I_app, p, y_old=None, dt=Non
     sqrt_ce_n_avg = torch.sum(torch.sqrt(torch.clamp(ce_real[:physics.Nx_n], min=1e-12)) * physics.W_n)
     sqrt_ce_p_avg = torch.sum(torch.sqrt(torch.clamp(ce_real[-physics.Nx_p:], min=1e-12)) * physics.W_p)
     
-    j0_n = p['m_ref_n'] * arr_n * sqrt_ce_n_avg * torch.sqrt(torch.clamp(cs_n[-1] * (p['cs_max_n'] - cs_n[-1]), min=1e-12))
-    j0_p = p['m_ref_p'] * arr_p * sqrt_ce_p_avg * torch.sqrt(torch.clamp(cs_p[-1] * (p['cs_max_p'] - cs_p[-1]), min=1e-12))
+    # Resolve reaction rate constants: use callable if chemistry provides CSV-based functions
+    _fn_m_ref_n = getattr(physics, 'fn_m_ref_n', None)
+    _fn_m_ref_p = getattr(physics, 'fn_m_ref_p', None)
+    m_ref_n_val = _fn_m_ref_n(cs_n[-1]) if _fn_m_ref_n is not None else p['m_ref_n']
+    m_ref_p_val = _fn_m_ref_p(cs_p[-1]) if _fn_m_ref_p is not None else p['m_ref_p']
+    
+    j0_n = m_ref_n_val * arr_n * sqrt_ce_n_avg * torch.sqrt(torch.clamp(cs_n[-1] * (p['cs_max_n'] - cs_n[-1]), min=1e-12))
+    j0_p = m_ref_p_val * arr_p * sqrt_ce_p_avg * torch.sqrt(torch.clamp(cs_p[-1] * (p['cs_max_p'] - cs_p[-1]), min=1e-12))
+
     
     term_RTF = 2 * p['R_g'] * T_cell / p['F']
 
@@ -205,10 +240,16 @@ def compute_derivatives_functional(physics, y_flat, I_app, p, y_old=None, dt=Non
     ce_s = ce_real[physics.Nx_n:physics.Nx_n+physics.Nx_s]
     ce_p = ce_real[-physics.Nx_p:]
     
-    def get_Deff(c, eps):
-        c_m = c / 1000.0
-        return (8.79e-11*c_m**2 - 3.97e-10*c_m + 4.86e-10) * (eps**p['b'])
-        
+    # Use chemistry-loaded diff_e if available, otherwise the analytic fallback
+    _chem = getattr(physics, 'chemistry', None)
+    if _chem is not None and 'diff_e' in _chem:
+        def get_Deff(c, eps, _fn=_chem['diff_e']):
+            return _fn(c, p.get('T', 298.15)) * (eps**p['b'])
+    else:
+        def get_Deff(c, eps):
+            c_m = c / 1000.0
+            return (8.79e-11*c_m**2 - 3.97e-10*c_m + 4.86e-10) * (eps**p['b'])
+
     Deff_n = get_Deff(ce_n, p['eps_e_n'])
     Deff_s = get_Deff(ce_s, p['eps_e_s'])
     Deff_p = get_Deff(ce_p, p['eps_e_p'])

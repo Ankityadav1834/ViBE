@@ -21,14 +21,22 @@ from pde_framework import (
 )
 from solver import BasicSolver, AdvancedSolver, ControlledSolver
 
+import os
+from parameter_loader import load_chemistry_from_folder, list_available_chemistries
+
 # Use Double Precision for Battery Physics Stability
 torch.set_default_dtype(torch.float64)
 
+# Default parameters/ directory (siblings to main.py)
+_PARAMETERS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'parameters')
+
 class BatteryPhysics(torch.nn.Module):
-    def __init__(self, config, disc, params_list, device):
+    def __init__(self, config, disc, params_list, device, chemistry=None):
         super().__init__()
         self.device = device
         self.n_cells = len(params_list)
+        # Store the chemistry dict so electrochemistry.py can read OCP/diff_e etc.
+        self.chemistry = chemistry
         
         # Discretization
         self.Nr_n, self.Nr_p = disc['Nr_n'], disc['Nr_p']
@@ -87,7 +95,15 @@ class BatteryPhysics(torch.nn.Module):
         self.state_layout = self._build_state_layout(config)
         self.state_size = self.state_layout.total_size
         
-        # Pack parameters into a dictionary of tensors [N_cells, 1]
+        # --- Separate callable params from scalar/tensor params ---
+        # physics.params must be a pure dict-of-tensors so torch.vmap and
+        # torch.func.jacrev can batch over it.  CSV-loaded function-valued
+        # parameters (Ds_n, Ds_p, m_ref_n, m_ref_p) are stored separately
+        # in physics.callable_params as a list-of-dicts (one dict per cell).
+        # electrochemistry.py reads callable_params[cell_idx][key] directly.
+        CALLABLE_KEYS = {'Ds_n', 'Ds_p', 'm_ref_n', 'm_ref_p'}
+        
+        # Keys that go into the tensor params dict
         keys = [
             'Ln','Ls','Lp','A','Rs_n','Rs_p','F','R_g','T','Ds_n','Ds_p',
             'cs_max_n','cs_max_p','as_n','as_p','t_plus','b',
@@ -98,10 +114,38 @@ class BatteryPhysics(torch.nn.Module):
             'ce_0', 'Lsei_0', 'R_contact', 'R_bus'
         ]
         
+        # Build callable_params: list of per-cell dicts with any callables
+        self.callable_params = []
+        for p in params_list:
+            cell_fns = {}
+            for k in CALLABLE_KEYS:
+                v = p.get(k, None)
+                if callable(v):
+                    cell_fns[k] = v
+            self.callable_params.append(cell_fns)
+
+        # Build tensor params dict: use scalar fallback for callable keys
+        # (the scalar is only used as a placeholder; actual computation in
+        #  electrochemistry.py routes through callable_params when present)
         self.params = {}
         for k in keys:
-            vals = [p.get(k, 0.0) for p in params_list]
+            vals = []
+            for p in params_list:
+                v = p.get(k, 0.0)
+                if callable(v):
+                    vals.append(0.0)   # placeholder; callable_params is the source
+                else:
+                    vals.append(float(v))
             self.params[k] = torch.tensor(vals, device=device).reshape(-1, 1)
+
+        # Convenience physics-level callables (shared across cells).
+        # These are set from cell-0's callable_params; in practice all cells
+        # share the same chemistry functions.  Per-cell overrides can be added
+        # by modifying callable_params[i] entries directly.
+        for k in ('Ds_n', 'Ds_p', 'm_ref_n', 'm_ref_p'):
+            fn = self.callable_params[0].get(k, None) if self.callable_params else None
+            setattr(self, f'fn_{k}', fn)   # e.g. physics.fn_Ds_n = <callable | None>
+
 
     def _build_state_layout(self, config):
         layout = StateLayout()
@@ -390,6 +434,13 @@ class BatteryPhysics(torch.nn.Module):
     
     def calculate_ocp(self, stoich, electrode):
         s = torch.clamp(stoich, 0.001, 0.999)
+        chem = getattr(self, 'chemistry', None)
+        if chem is not None:
+            if electrode == 'anode':
+                return chem['ocp_n'](s)
+            else:
+                return chem['ocp_p'](s)
+        # Fallback: Li-ion Chen2020 analytic OCP
         if electrode == 'anode':
             return (1.9793 * torch.exp(-39.3631*s) + 0.2482 - 
                     0.0909 * torch.tanh(29.8538*(s-0.1234)) - 
@@ -465,8 +516,23 @@ class ImplicitBatterySolver:
         initial_state_mode='fully_charged',
         initial_state_options=None,
         balancing_options=None,
-        thermal_options=None
+        thermal_options=None,
+        chemistry=None,
+        chemistry_folder=None,
     ):
+        """
+        Parameters
+        ----------
+        chemistry : dict, optional
+            A chemistry dict as returned by ``load_chemistry_from_folder()``.
+            If provided, it overrides the default Li-ion parameters.
+        chemistry_folder : str, optional
+            Path to a chemistry parameter folder (must contain ``params.json``).
+            The loader reads scalars from ``params.json`` and builds
+            interpolating functions from any CSV files present.
+            If both *chemistry* and *chemistry_folder* are given, *chemistry*
+            takes precedence.
+        """
         _dev = config.get('device', 'auto')
         if _dev == 'auto' or _dev is None:
             self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -480,12 +546,20 @@ class ImplicitBatterySolver:
         self.balancing_options = balancing_options or {'enabled': False, 'strategy': 'none'}
         self.thermal_options = thermal_options or {'enabled': False, 'strategy': 'ambient'}
         
-        self.raw_params = [self.get_standard_parameters() for _ in range(self.n_cells)]
+        # ---- Resolve chemistry -----------------------------------------
+        if chemistry is None and chemistry_folder is not None:
+            chemistry = load_chemistry_from_folder(chemistry_folder)
+
+        self._chemistry = chemistry  # may be None (legacy / default Li-ion)
+
+        # ---- Build per-cell parameter list ---------------------------------
+        self.raw_params = [self.get_standard_parameters(chemistry) for _ in range(self.n_cells)]
         if overrides:
             for k, v in overrides.items():
                 self.raw_params[k[0]*config['n_parallel'] + k[1]].update(v)
                 
-        self.physics = BatteryPhysics(config, discretization, self.raw_params, self.device)
+        self.physics = BatteryPhysics(config, discretization, self.raw_params, self.device,
+                                      chemistry=self._chemistry)
         self.sei_enabled = self.physics.sei_enabled
         self.Gth = self._build_thermal_connection_matrix().to(self.device)
         self.Cth = torch.tensor([p['rho_Cp']*p['Vol_cell'] for p in self.raw_params], device=self.device).reshape(-1,1)
@@ -806,7 +880,8 @@ class ImplicitBatterySolver:
         if not run_name or run_name == '-c':
             run_name = 'default_run'
 
-        out_dir = os.path.join(os.getcwd(), 'simulation_result', run_name, 'results')
+        project_root = os.path.dirname(os.path.abspath(__file__))
+        out_dir = os.path.join(project_root, 'simulation_result', run_name, 'results')
         os.makedirs(out_dir, exist_ok=True)
 
         # Use caller's spec or fall back to the default
@@ -816,7 +891,7 @@ class ImplicitBatterySolver:
         # Pin the project root so local modules (electrochemistry, etc.)
         # remain importable after os.chdir moves into the output directory.
         import sys as _sys
-        _project_root = old_cwd
+        _project_root = project_root
         if _project_root not in _sys.path:
             _sys.path.insert(0, _project_root)
         os.chdir(out_dir)
@@ -850,7 +925,33 @@ class ImplicitBatterySolver:
         return G
 
     @staticmethod
-    def get_standard_parameters():
+    def get_standard_parameters(chemistry=None):
+        """
+        Return the default parameter dict for a single cell.
+
+        Parameters
+        ----------
+        chemistry : dict, optional
+            A chemistry dict loaded via ``load_chemistry_from_folder()``.  If
+            supplied, its ``params`` sub-dict is used as the starting point,
+            which means CSV-based function parameters (Ds_n, Ds_p, m_ref_n,
+            m_ref_p) are automatically included.
+            If *None*, the original hardcoded Li-ion Chen2020 values are used
+            so existing scripts need no changes.
+        """
+        if chemistry is not None:
+            # Start from the loaded chemistry's scalar / callable parameters
+            base = dict(chemistry['params'])
+            # Ensure every key expected by BatteryPhysics is present
+            defaults = {
+                'Dsolv': 0.0, 'kf': 0.0, 'beta': 0.0,
+                'R_contact': 1e-2, 'R_bus': 1e-4,
+            }
+            for k, v in defaults.items():
+                base.setdefault(k, v)
+            return base
+
+        # --- Legacy Li-ion Chen2020 hardcoded default ---
         return {
             'Ln': 8.52e-05, 'Ls': 1.20e-05, 'Lp': 7.56e-05, 'A': 0.1027, 'Rs_n': 5.86e-06, 'Rs_p': 5.22e-06,
             'F': 96485.33, 'R_g': 8.314, 'Ds_n': 3.3e-14, 'Ds_p': 4e-15, 'cs_max_n': 33133.0, 'cs_max_p': 63104.0,
