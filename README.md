@@ -1,6 +1,6 @@
 <div align="center">
 
-# ⚡ VIBE — Variable-fidelity Implicit Battery Emulator
+# ⚡ VIBE — Virtual Battery Environment 
 
 **A physics-based, GPU-accelerated battery pack simulation framework built with PyTorch.**  
 Designed for researchers studying electrochemical degradation, pack heterogeneity, thermal management, and optimal charging control.
